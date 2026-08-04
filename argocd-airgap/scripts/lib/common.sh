@@ -344,37 +344,123 @@ _pull_with_crane() {
 # ---------------------------------------------------------------------------
 # Push a single image reference already present in the local runtime.
 # Prefer skopeo with --format=oci — Zot rejects Docker schema2 manifests (HTTP 415).
-# Fall back to crane, then the runtime's native push.
+# For plain-HTTP registries (typical lab Zot), skopeo needs registries.conf
+# insecure=true — --dest-tls-verify=false alone still speaks HTTPS.
+# Fall back to ctr --plain-http, then crane --insecure.
 # ---------------------------------------------------------------------------
+
+# Host[:port] from an image reference (zot-registry:30001/foo/bar:tag → zot-registry:30001)
+image_registry_host() {
+  local image="$1"
+  echo "${image%%/*}"
+}
+
+# Write a registries.conf that marks a registry as HTTP/insecure for skopeo/c/image.
+write_insecure_registries_conf() {
+  local registry="$1"
+  local conf_file="$2"
+  cat >"$conf_file" <<EOF
+# Generated for plain-HTTP push to ${registry}
+[[registry]]
+prefix = "${registry}"
+location = "${registry}"
+insecure = true
+
+[[registry]]
+location = "${registry}"
+insecure = true
+EOF
+}
+
+# skopeo copy → docker://dest with optional plain HTTP.
+# Returns 0 on success. Sets _skopeo_http_hint=1 if failure looks like HTTPS-vs-HTTP.
+skopeo_copy_oci() {
+  local src="$1"
+  local dest_image="$2"
+  local insecure="${3:-0}"
+  local conf="" errfile rc
+  local -a args=(copy --format=oci)
+  _skopeo_http_hint=0
+
+  errfile="$(mktemp)"
+  if [[ "$insecure" -eq 1 ]]; then
+    conf="$(mktemp)"
+    write_insecure_registries_conf "$(image_registry_host "$dest_image")" "$conf"
+    args+=(--dest-tls-verify=false)
+    # containers/image reads this for insecure/HTTP registry policy
+    export CONTAINERS_REGISTRIES_CONF="$conf"
+  fi
+
+  if [[ "$insecure" -eq 1 ]]; then
+    info "skopeo copy (oci, plain-http) ${dest_image}"
+  else
+    info "skopeo copy (oci) ${dest_image}"
+  fi
+  set +e
+  skopeo "${args[@]}" "$src" "docker://${dest_image}" 2>"$errfile"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    cat "$errfile" >&2
+    if grep -qiE 'HTTP response to HTTPS|server gave HTTP response|http: server gave' "$errfile"; then
+      _skopeo_http_hint=1
+    fi
+  fi
+
+  [[ -n "$conf" ]] && rm -f "$conf"
+  unset CONTAINERS_REGISTRIES_CONF
+  rm -f "$errfile"
+  return "$rc"
+}
+
 push_image() {
   local runtime="$1"
   local image="$2"
   local insecure="${3:-0}"
 
+  # Prefer ctr native push for HTTP registries when using --runtime ctr
+  if [[ "$runtime" == "ctr" && "$insecure" -eq 1 ]]; then
+    local args=(images push --plain-http)
+    if [[ -n "${PRIVATE_REGISTRY_USER:-}" ]]; then
+      args+=(--user "${PRIVATE_REGISTRY_USER}:${PRIVATE_REGISTRY_PASSWORD:-}")
+    fi
+    info "ctr images push --plain-http ${image}"
+    if ctr_cmd "${args[@]}" "$image"; then
+      return 0
+    fi
+    warn "ctr plain-http push failed (Zot may require OCI manifests); trying skopeo"
+  fi
+
   if command -v skopeo >/dev/null 2>&1; then
-    local src dest_tls=true
+    local src tmp=""
     case "$runtime" in
       podman) src="containers-storage:${image}" ;;
       ctr)
-        # Export from containerd, then skopeo push from oci-archive
-        local tmp
         tmp="$(mktemp)"
         runtime_save ctr "$tmp" "$image"
-        [[ "$insecure" -eq 1 ]] && dest_tls=false
-        info "skopeo copy (oci-archive via ctr) ${image}"
-        if ! skopeo copy --format=oci --dest-tls-verify="$dest_tls" "oci-archive:${tmp}" "docker://${image}"; then
-          rm -f "$tmp"
-          die "skopeo push failed for ${image}"
-        fi
-        rm -f "$tmp"
-        return
+        src="oci-archive:${tmp}"
         ;;
       *) src="docker-daemon:${image}" ;;
     esac
-    [[ "$insecure" -eq 1 ]] && dest_tls=false
-    info "skopeo copy (oci) ${image}"
-    skopeo copy --format=oci --dest-tls-verify="$dest_tls" "$src" "docker://${image}"
-    return
+
+    if skopeo_copy_oci "$src" "$image" "$insecure"; then
+      [[ -n "$tmp" ]] && rm -f "$tmp"
+      return 0
+    fi
+
+    # Auto-retry once with plain HTTP if the registry spoke HTTP to an HTTPS client
+    if [[ "$insecure" -ne 1 && "${_skopeo_http_hint:-0}" -eq 1 ]]; then
+      warn "Registry appears to be plain HTTP (not HTTPS)."
+      warn "Retrying with insecure/HTTP mode. Pass --insecure-registry next time."
+      if skopeo_copy_oci "$src" "$image" 1; then
+        [[ -n "$tmp" ]] && rm -f "$tmp"
+        return 0
+      fi
+    fi
+
+    [[ -n "$tmp" ]] && rm -f "$tmp"
+    die "skopeo push failed for ${image}. For HTTP Zot use: --registry HOST:PORT --insecure-registry"
   fi
 
   if command -v crane >/dev/null 2>&1; then
@@ -389,6 +475,13 @@ push_image() {
     fi
     warn "skopeo not found; crane may fail against Zot (Docker schema2 → HTTP 415). Install skopeo for OCI pushes."
     if ! crane "${crane_args[@]}" "$tmp" "$image"; then
+      if [[ "$insecure" -ne 1 ]]; then
+        warn "Retrying crane push with --insecure (plain HTTP)"
+        if crane push --insecure "$tmp" "$image"; then
+          rm -f "$tmp"
+          return 0
+        fi
+      fi
       rm -f "$tmp"
       die "crane push failed for ${image}"
     fi

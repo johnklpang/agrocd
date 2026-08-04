@@ -96,13 +96,27 @@ cd argocd-airgap
 
 `--use-zot` reads `artifacts/zot.env` (written by `03-zot-registry.sh`) and enables insecure HTTP pushes to Zot.
 
-### In-cluster Zot (optional)
+### Existing Zot registry (HTTP)
+
+If Zot is already running (for example NodePort `zot-registry:30001`), do **not** start a new one. Push with plain HTTP:
 
 ```bash
-# After the Zot image is available on the nodes (or bootstrap with container backend first):
-./scripts/03-zot-registry.sh start --backend helm --namespace zot
+./scripts/02-airgap-deploy.sh \
+  --runtime ctr \
+  --registry zot-registry:30001 \
+  --insecure-registry \
+  --artifacts ./artifacts
+```
 
-./scripts/02-airgap-deploy.sh --use-zot --artifacts ./artifacts
+`--insecure-registry` is required for HTTP Zot. Without it, skopeo tries HTTPS and fails with:
+`http: server gave HTTP response to HTTPS client`.
+
+Equivalent:
+
+```bash
+export PRIVATE_REGISTRY=zot-registry:30001
+./scripts/02-airgap-deploy.sh --runtime ctr --use-zot --insecure-registry --artifacts ./artifacts
+# --use-zot forces insecure HTTP when PRIVATE_REGISTRY is already set
 ```
 
 ## Zot registry commands
