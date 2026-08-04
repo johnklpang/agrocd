@@ -35,7 +35,9 @@
 #   --mode MODE             load | push | load-and-push  (default: auto)
 #                             auto = push if --registry set, else load
 #   --values FILE           Extra Helm values file(s); may be repeated
-#   --runtime NAME          Container CLI: docker|podman|nerdctl
+#   --runtime NAME          Container CLI: docker|podman|nerdctl|ctr
+#   --ctr-namespace NS      containerd namespace for ctr (default: k8s.io)
+#   --ctr-address PATH      containerd socket path
 #   --kube-context CTX      kubectl/helm context
 #   --wait-timeout DUR      Helm --timeout (default: 10m)
 #   --dry-run               Render / plan only; do not install
@@ -73,7 +75,7 @@ REGISTRY_REWRITE_MODE="${REGISTRY_REWRITE_MODE:-keep-path}"
 EXTRA_VALUES=()
 
 usage() {
-  sed -n '2,50p' "$0" | sed 's/^# \?//'
+  sed -n '2,52p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -92,6 +94,8 @@ while [[ $# -gt 0 ]]; do
     --mode)              MODE="$2"; shift 2 ;;
     --values)            EXTRA_VALUES+=("$2"); shift 2 ;;
     --runtime)           RUNTIME="$2"; shift 2 ;;
+    --ctr-namespace)     CTR_NAMESPACE="$2"; shift 2 ;;
+    --ctr-address)       CTR_ADDRESS="$2"; shift 2 ;;
     --kube-context)      KUBE_CONTEXT="$2"; shift 2 ;;
     --wait-timeout)      WAIT_TIMEOUT="$2"; shift 2 ;;
     --dry-run)           DRY_RUN=1; shift ;;
@@ -106,6 +110,8 @@ done
 resolve_roots
 [[ -n "$RUNTIME" ]] && CONTAINER_RUNTIME="$RUNTIME"
 export REGISTRY_REWRITE_MODE
+export CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
+export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
 # ---------------------------------------------------------------------------
 # Zot integration: load artifacts/zot.env produced by 03-zot-registry.sh
@@ -123,6 +129,9 @@ if [[ "$USE_ZOT" -eq 1 ]]; then
   INSECURE_REGISTRY=1
   info "Using Zot registry: ${PRIVATE_REGISTRY} (insecure HTTP pushes enabled)"
 fi
+
+# Propagate insecure flag to pull helpers (after --use-zot may set it)
+export PULL_INSECURE="$INSECURE_REGISTRY"
 
 # Resolve mode
 case "$MODE" in
@@ -143,6 +152,9 @@ fi
 
 require_cmds awk sort
 RUNTIME="$(detect_runtime)"
+if [[ "$RUNTIME" == "ctr" ]]; then
+  require_cmds ctr
+fi
 
 # helm/kubectl only required when we will talk to the cluster
 if [[ "$SKIP_HELM" -eq 0 ]]; then
@@ -172,6 +184,9 @@ info "Namespace / release : ${NAMESPACE} / ${RELEASE_NAME}"
 info "Mode                : ${MODE}"
 info "Private registry    : ${PRIVATE_REGISTRY:-<none — local load only>}"
 info "Container runtime   : ${RUNTIME}"
+if [[ "$RUNTIME" == "ctr" ]]; then
+  info "ctr namespace       : ${CTR_NAMESPACE}"
+fi
 info "Rewrite mode        : ${REGISTRY_REWRITE_MODE}"
 
 HELM_CTX_ARGS=()
@@ -188,15 +203,8 @@ registry_login() {
   [[ -n "$PRIVATE_REGISTRY" ]] || return 0
   if [[ -n "$PRIVATE_REGISTRY_USER" ]]; then
     info "Logging into registry ${PRIVATE_REGISTRY} as ${PRIVATE_REGISTRY_USER}"
-    local login_args=(login)
-    if [[ "$INSECURE_REGISTRY" -eq 1 ]]; then
-      # docker uses --insecure-registry at daemon level; podman/nerdctl accept flags
-      if [[ "$RUNTIME" == "podman" || "$RUNTIME" == "nerdctl" ]]; then
-        login_args+=(--tls-verify=false)
-      fi
-    fi
-    login_args+=(-u "$PRIVATE_REGISTRY_USER" --password-stdin "$PRIVATE_REGISTRY")
-    printf '%s' "$PRIVATE_REGISTRY_PASSWORD" | "$RUNTIME" "${login_args[@]}"
+    runtime_login "$RUNTIME" "$PRIVATE_REGISTRY" \
+      "$PRIVATE_REGISTRY_USER" "$PRIVATE_REGISTRY_PASSWORD" "$INSECURE_REGISTRY"
   else
     warn "No registry credentials provided; assuming anonymous or pre-authenticated access"
   fi
@@ -208,7 +216,7 @@ registry_login() {
 load_images() {
   section "1/4 Load images from tar archive"
   info "Loading ${IMAGES_TAR} into ${RUNTIME}..."
-  "$RUNTIME" load -i "$IMAGES_TAR"
+  runtime_load "$RUNTIME" "$IMAGES_TAR"
   info "Image load complete"
 }
 
@@ -231,7 +239,7 @@ push_images() {
     new_image="$(rewrite_image "$original" "$PRIVATE_REGISTRY")"
     info "Tag  ${original}"
     info "  -> ${new_image}"
-    "$RUNTIME" tag "$original" "$new_image"
+    runtime_tag "$RUNTIME" "$original" "$new_image"
 
     info "Push ${new_image}"
     push_image "$RUNTIME" "$new_image" "$INSECURE_REGISTRY"

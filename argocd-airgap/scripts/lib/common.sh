@@ -30,8 +30,12 @@ require_cmds() {
 }
 
 # ---------------------------------------------------------------------------
-# Detect container runtime CLI (docker | podman | nerdctl)
+# Detect container runtime CLI (docker | podman | nerdctl | ctr)
 # Prefer CONTAINER_RUNTIME override when set.
+#
+# For ctr (containerd):
+#   CTR_NAMESPACE  — containerd namespace (default: k8s.io, what kubelet uses)
+#   CTR_ADDRESS    — containerd socket (default: /run/containerd/containerd.sock)
 # ---------------------------------------------------------------------------
 detect_runtime() {
   if [[ -n "${CONTAINER_RUNTIME:-}" ]]; then
@@ -41,27 +45,246 @@ detect_runtime() {
     return
   fi
   local rt
-  for rt in docker podman nerdctl; do
+  for rt in docker podman nerdctl ctr; do
     if command -v "$rt" >/dev/null 2>&1; then
       echo "$rt"
       return
     fi
   done
-  die "No container runtime found (docker, podman, or nerdctl). Install one or set CONTAINER_RUNTIME."
+  die "No container runtime found (docker, podman, nerdctl, or ctr). Install one or set CONTAINER_RUNTIME."
+}
+
+# Build the ctr base command with namespace / address.
+# Uses sudo when the containerd socket is not writable by the current user.
+# Usage: ctr_cmd images pull ...
+ctr_cmd() {
+  local args=()
+  local ns="${CTR_NAMESPACE:-k8s.io}"
+  local addr="${CTR_ADDRESS:-/run/containerd/containerd.sock}"
+  local ctr_bin
+  ctr_bin="$(command -v ctr)"
+
+  # Elevate when needed (typical: /run/containerd/containerd.sock is root:root)
+  if [[ ! -w "$addr" ]] && command -v sudo >/dev/null 2>&1; then
+    args+=(sudo)
+    # Preserve non-interactive environments
+    args+=(-n)
+  fi
+  args+=("$ctr_bin")
+  [[ -n "$ns" ]] && args+=(-n "$ns")
+  [[ -n "$addr" ]] && args+=(--address "$addr")
+
+  # If sudo -n fails (no passwordless sudo), retry without -n once when interactive
+  if [[ "${args[0]}" == "sudo" ]]; then
+    if ! sudo -n true 2>/dev/null; then
+      args=(sudo "$ctr_bin")
+      [[ -n "$ns" ]] && args+=(-n "$ns")
+      [[ -n "$addr" ]] && args+=(--address "$addr")
+    fi
+  fi
+  "${args[@]}" "$@"
 }
 
 # ---------------------------------------------------------------------------
-# Pull a single image. Uses crane when PULL_TOOL=crane or when the runtime
-# pull fails (common in restricted/rootless overlayfs environments).
+# Runtime-agnostic image operations (docker/podman/nerdctl/ctr)
+# ---------------------------------------------------------------------------
+runtime_pull() {
+  local runtime="$1"
+  local image="$2"
+  local insecure="${3:-0}"
+
+  case "$runtime" in
+    ctr)
+      local args=(images pull)
+      local platform="${CTR_PLATFORM:-}"
+      if [[ -z "$platform" ]]; then
+        case "$(uname -m)" in
+          x86_64|amd64) platform=linux/amd64 ;;
+          aarch64|arm64) platform=linux/arm64 ;;
+        esac
+      fi
+      [[ -n "$platform" ]] && args+=(--platform "$platform")
+      if [[ "$insecure" -eq 1 ]]; then
+        args+=(--plain-http)
+      fi
+      if [[ -n "${PRIVATE_REGISTRY_USER:-}" ]]; then
+        args+=(--user "${PRIVATE_REGISTRY_USER}:${PRIVATE_REGISTRY_PASSWORD:-}")
+      fi
+      info "ctr images pull ${image}${platform:+ (${platform})}"
+      ctr_cmd "${args[@]}" "$image"
+      ;;
+    *)
+      "$runtime" pull "$image"
+      ;;
+  esac
+}
+
+runtime_save() {
+  local runtime="$1"
+  local outfile="$2"
+  shift 2
+  local images=("$@")
+  ((${#images[@]} > 0)) || die "runtime_save: no images provided"
+
+  case "$runtime" in
+    ctr)
+      # ctr export writes an OCI archive (compatible with ctr import / many tools)
+      info "ctr images export ${outfile}"
+      ctr_cmd images export "$outfile" "${images[@]}"
+      ;;
+    *)
+      "$runtime" save -o "$outfile" "${images[@]}"
+      ;;
+  esac
+}
+
+runtime_load() {
+  local runtime="$1"
+  local infile="$2"
+
+  case "$runtime" in
+    ctr)
+      info "ctr images import ${infile}"
+      local platform="${CTR_PLATFORM:-}"
+      if [[ -z "$platform" ]]; then
+        case "$(uname -m)" in
+          x86_64|amd64) platform=linux/amd64 ;;
+          aarch64|arm64) platform=linux/arm64 ;;
+        esac
+      fi
+      local import_args=(images import)
+      [[ -n "$platform" ]] && import_args+=(--platform "$platform")
+      # Prefer unpacking (needed for local runs). On restricted hosts where
+      # overlay whiteouts fail, fall back to --no-unpack so content can still
+      # be exported/pushed for air-gap transfer; target nodes unpack on import.
+      if [[ "${CTR_NO_UNPACK:-0}" == "1" ]]; then
+        import_args+=(--no-unpack)
+        ctr_cmd "${import_args[@]}" "$infile"
+      elif ! ctr_cmd "${import_args[@]}" "$infile"; then
+        warn "ctr import unpack failed; retrying with --no-unpack"
+        import_args+=(--no-unpack)
+        ctr_cmd "${import_args[@]}" "$infile"
+      fi
+      ;;
+    *)
+      "$runtime" load -i "$infile"
+      ;;
+  esac
+}
+
+runtime_tag() {
+  local runtime="$1"
+  local source="$2"
+  local target="$3"
+
+  case "$runtime" in
+    ctr)
+      info "ctr images tag ${source} -> ${target}"
+      ctr_cmd images tag "$source" "$target"
+      ;;
+    *)
+      "$runtime" tag "$source" "$target"
+      ;;
+  esac
+}
+
+runtime_inspect() {
+  local runtime="$1"
+  local image="$2"
+
+  case "$runtime" in
+    ctr)
+      # Match exact ref or a line containing the ref (ctr may normalize hosts)
+      ctr_cmd images ls -q 2>/dev/null | grep -F "$image" | grep -q .
+      ;;
+    *)
+      "$runtime" image inspect "$image" >/dev/null 2>&1
+      ;;
+  esac
+}
+
+runtime_login() {
+  local runtime="$1"
+  local registry="$2"
+  local user="$3"
+  local pass="$4"
+  local insecure="${5:-0}"
+
+  case "$runtime" in
+    ctr)
+      # ctr has no login; credentials are passed per-pull/push via --user
+      warn "ctr has no persistent login; use --user on pull/push or configure registry auth"
+      return 0
+      ;;
+    podman|nerdctl)
+      local login_args=(login)
+      [[ "$insecure" -eq 1 ]] && login_args+=(--tls-verify=false)
+      login_args+=(-u "$user" --password-stdin "$registry")
+      printf '%s' "$pass" | "$runtime" "${login_args[@]}"
+      ;;
+    *)
+      printf '%s' "$pass" | "$runtime" login -u "$user" --password-stdin "$registry"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Pull a single image.
+# PULL_TOOL: auto | runtime | crane | ctr
+#   auto    — try the selected runtime, fall back to crane
+#   runtime — only the selected runtime (docker/podman/nerdctl/ctr)
+#   crane   — always crane, then import into the runtime
+#   ctr     — always use containerd ctr (even if CONTAINER_RUNTIME is docker)
 # ---------------------------------------------------------------------------
 pull_image() {
   local runtime="$1"
   local image="$2"
   local tool="${PULL_TOOL:-auto}"
+  local insecure="${PULL_INSECURE:-0}"
 
   case "$tool" in
     runtime)
-      "$runtime" pull "$image"
+      runtime_pull "$runtime" "$image" "$insecure"
+      return
+      ;;
+    ctr)
+      command -v ctr >/dev/null 2>&1 || die "PULL_TOOL=ctr but 'ctr' is not installed"
+      if ! runtime_pull ctr "$image" "$insecure"; then
+        warn "ctr images pull failed for ${image}; trying crane + ctr import"
+        command -v crane >/dev/null 2>&1 || die "ctr pull failed and crane is not installed"
+        local tmp
+        tmp="$(mktemp)"
+        info "crane pull ${image}"
+        if ! crane pull "$image" "$tmp"; then
+          rm -f "$tmp"
+          die "crane pull failed for ${image}"
+        fi
+        # Force no-unpack path when overlay extract is broken on this host
+        CTR_NO_UNPACK="${CTR_NO_UNPACK:-0}" runtime_load ctr "$tmp" || true
+        if ! runtime_inspect ctr "$image"; then
+          # Explicit no-unpack retry
+          info "ctr images import --no-unpack (fallback)"
+          local platform="${CTR_PLATFORM:-linux/amd64}"
+          if ! ctr_cmd images import --no-unpack --platform "$platform" "$tmp"; then
+            rm -f "$tmp"
+            die "Failed to import ${image} into ctr after crane pull"
+          fi
+        fi
+        if ! runtime_inspect ctr "$image"; then
+          rm -f "$tmp"
+          die "Image ${image} not listed in ctr after import"
+        fi
+        rm -f "$tmp"
+      fi
+      # If the packaging runtime is not ctr, also make the image visible there
+      if [[ "$runtime" != "ctr" ]]; then
+        local tmp2
+        tmp2="$(mktemp)"
+        if ctr_cmd images export "$tmp2" "$image"; then
+          runtime_load "$runtime" "$tmp2" || warn "Imported via ctr but failed to load into ${runtime}"
+        fi
+        rm -f "$tmp2"
+      fi
       return
       ;;
     crane)
@@ -70,7 +293,7 @@ pull_image() {
       return
       ;;
     auto)
-      if "$runtime" pull "$image"; then
+      if runtime_pull "$runtime" "$image" "$insecure"; then
         return 0
       fi
       warn "Runtime pull failed for ${image}; falling back to crane (if available)"
@@ -78,10 +301,21 @@ pull_image() {
         _pull_with_crane "$runtime" "$image"
         return
       fi
-      die "Failed to pull ${image} (runtime pull failed and crane not installed)"
+      # Last resort: try ctr directly
+      if [[ "$runtime" != "ctr" ]] && command -v ctr >/dev/null 2>&1; then
+        warn "Trying ctr images pull for ${image}"
+        runtime_pull ctr "$image" "$insecure"
+        local tmp
+        tmp="$(mktemp)"
+        ctr_cmd images export "$tmp" "$image"
+        runtime_load "$runtime" "$tmp" || true
+        rm -f "$tmp"
+        return
+      fi
+      die "Failed to pull ${image} (runtime pull failed; crane/ctr unavailable or failed)"
       ;;
     *)
-      die "Invalid PULL_TOOL='${tool}' (expected: auto|runtime|crane)"
+      die "Invalid PULL_TOOL='${tool}' (expected: auto|runtime|crane|ctr)"
       ;;
   esac
 }
@@ -96,10 +330,9 @@ _pull_with_crane() {
     rm -rf "$tmp"
     die "crane pull failed for ${image}"
   fi
-  # Load into the local runtime so docker/podman save can package a multi-image tar.
-  # Ignore non-zero from whiteout warnings on some restricted hosts if the image appears.
-  if ! "$runtime" load -i "${tmp}/image.tar"; then
-    if ! "$runtime" image inspect "$image" >/dev/null 2>&1; then
+  # Load into the local runtime so save can package a multi-image tar.
+  if ! runtime_load "$runtime" "${tmp}/image.tar"; then
+    if ! runtime_inspect "$runtime" "$image"; then
       rm -rf "$tmp"
       die "Failed to load ${image} into ${runtime} after crane pull"
     fi
@@ -122,7 +355,21 @@ push_image() {
     local src dest_tls=true
     case "$runtime" in
       podman) src="containers-storage:${image}" ;;
-      *)      src="docker-daemon:${image}" ;;
+      ctr)
+        # Export from containerd, then skopeo push from oci-archive
+        local tmp
+        tmp="$(mktemp)"
+        runtime_save ctr "$tmp" "$image"
+        [[ "$insecure" -eq 1 ]] && dest_tls=false
+        info "skopeo copy (oci-archive via ctr) ${image}"
+        if ! skopeo copy --format=oci --dest-tls-verify="$dest_tls" "oci-archive:${tmp}" "docker://${image}"; then
+          rm -f "$tmp"
+          die "skopeo push failed for ${image}"
+        fi
+        rm -f "$tmp"
+        return
+        ;;
+      *) src="docker-daemon:${image}" ;;
     esac
     [[ "$insecure" -eq 1 ]] && dest_tls=false
     info "skopeo copy (oci) ${image}"
@@ -136,7 +383,7 @@ push_image() {
     if [[ "$insecure" -eq 1 ]]; then
       crane_args+=(--insecure)
     fi
-    if ! "$runtime" save -o "$tmp" "$image"; then
+    if ! runtime_save "$runtime" "$tmp" "$image"; then
       rm -f "$tmp"
       die "Failed to save ${image} for crane push"
     fi
@@ -148,6 +395,19 @@ push_image() {
     rm -f "$tmp"
     return
   fi
+
+  case "$runtime" in
+    ctr)
+      local args=(images push)
+      [[ "$insecure" -eq 1 ]] && args+=(--plain-http)
+      if [[ -n "${PRIVATE_REGISTRY_USER:-}" ]]; then
+        args+=(--user "${PRIVATE_REGISTRY_USER}:${PRIVATE_REGISTRY_PASSWORD:-}")
+      fi
+      info "ctr images push ${image}"
+      ctr_cmd "${args[@]}" "$image"
+      return
+      ;;
+  esac
 
   if [[ "$insecure" -eq 1 ]]; then
     warn "Pushing to an HTTP/insecure registry without skopeo/crane."

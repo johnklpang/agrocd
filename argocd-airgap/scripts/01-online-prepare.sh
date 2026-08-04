@@ -20,13 +20,16 @@
 #   --chart-version VER   Pin chart version (default: latest from repo)
 #   --values FILE         Extra Helm values used when rendering for image discovery
 #   --artifacts DIR       Output directory (default: ./artifacts)
-#   --runtime NAME        Container CLI: docker|podman|nerdctl (auto-detect)
+#   --runtime NAME        Container CLI: docker|podman|nerdctl|ctr (auto-detect)
 #   --repo-url URL        Helm repo URL (default: https://argoproj.github.io/argo-helm)
 #   --repo-name NAME      Helm repo name (default: argo)
 #   --chart-name NAME     Chart name within the repo (default: argo-cd)
 #   --skip-pull           Skip image pull (re-package from already-local images)
-#   --pull-tool TOOL      auto (default) | runtime | crane
-#                         auto: try docker/podman pull, fall back to crane
+#   --pull-tool TOOL      auto (default) | runtime | crane | ctr
+#                         auto: try selected runtime, fall back to crane/ctr
+#                         ctr:  always download with containerd `ctr images pull`
+#   --ctr-namespace NS    containerd namespace for ctr (default: k8s.io)
+#   --ctr-address PATH    containerd socket (default: /run/containerd/containerd.sock)
 #   --with-zot            Also pull the Zot registry image + Helm chart for
 #                         use as the air-gapped local OCI registry
 #   --zot-image REF       Override Zot image (default: ghcr.io/project-zot/zot)
@@ -68,7 +71,7 @@ ZOT_HELM_REPO_URL="${ZOT_HELM_REPO_URL:-https://zotregistry.dev/helm-charts}"
 ZOT_HELM_REPO_NAME="${ZOT_HELM_REPO_NAME:-project-zot}"
 
 usage() {
-  sed -n '2,46p' "$0" | sed 's/^# \?//'
+  sed -n '2,50p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -86,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --chart-name)    CHART_NAME="$2"; shift 2 ;;
     --skip-pull)     SKIP_PULL=1; shift ;;
     --pull-tool)     PULL_TOOL="$2"; shift 2 ;;
+    --ctr-namespace) CTR_NAMESPACE="$2"; shift 2 ;;
+    --ctr-address)   CTR_ADDRESS="$2"; shift 2 ;;
     --with-zot)      WITH_ZOT=1; shift ;;
     --zot-image)     ZOT_IMAGE_REF="$2"; shift 2 ;;
     --zot-chart-version) ZOT_CHART_VERSION="$2"; shift 2 ;;
@@ -97,15 +102,20 @@ done
 resolve_roots
 [[ -n "$RUNTIME" ]] && CONTAINER_RUNTIME="$RUNTIME"
 export PULL_TOOL
+export CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
+export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
 require_cmds helm awk sort
 RUNTIME="$(detect_runtime)"
+if [[ "$PULL_TOOL" == "ctr" || "$RUNTIME" == "ctr" ]]; then
+  require_cmds ctr
+fi
 if [[ "$PULL_TOOL" == "crane" ]] || [[ "$PULL_TOOL" == "auto" ]]; then
   if ! command -v crane >/dev/null 2>&1; then
     if [[ "$PULL_TOOL" == "crane" ]]; then
       die "crane not found (install https://github.com/google/go-containerregistry)"
     fi
-    warn "crane not found; PULL_TOOL=auto will not be able to fall back"
+    warn "crane not found; PULL_TOOL=auto will not be able to fall back to crane"
   fi
 fi
 
@@ -115,6 +125,11 @@ info "Artifacts directory : ${ARTIFACTS_DIR}"
 info "Helm repo           : ${HELM_REPO_NAME} -> ${HELM_REPO_URL}"
 info "Chart               : ${CHART_NAME}${CHART_VERSION:+ (version ${CHART_VERSION})}"
 info "Container runtime   : ${RUNTIME}"
+info "Pull tool           : ${PULL_TOOL}"
+if [[ "$RUNTIME" == "ctr" || "$PULL_TOOL" == "ctr" ]]; then
+  info "ctr namespace       : ${CTR_NAMESPACE}"
+  info "ctr address         : ${CTR_ADDRESS:-/run/containerd/containerd.sock (default)}"
+fi
 info "Include Zot registry: $([[ "$WITH_ZOT" -eq 1 ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
@@ -207,8 +222,7 @@ fi
 section "4/6 Package images into tar archive"
 
 info "Saving ${#IMAGES[@]} image(s) -> ${IMAGES_TAR}"
-# docker/podman/nerdctl all support: save -o file.tar IMAGE [IMAGE...]
-"$RUNTIME" save -o "$IMAGES_TAR" "${IMAGES[@]}"
+runtime_save "$RUNTIME" "$IMAGES_TAR" "${IMAGES[@]}"
 # Sanity check
 [[ -s "$IMAGES_TAR" ]] || die "Image archive is empty: $IMAGES_TAR"
 IMAGES_TAR_SIZE="$(du -h "$IMAGES_TAR" | awk '{print $1}')"
@@ -275,7 +289,7 @@ if [[ "$WITH_ZOT" -eq 1 ]]; then
 
   printf '%s\n' "$ZOT_IMAGE_REF" >"${ARTIFACTS_DIR}/zot-images.txt"
 
-  if [[ "$SKIP_PULL" -eq 1 ]] && "$RUNTIME" image inspect "$ZOT_IMAGE_REF" >/dev/null 2>&1; then
+  if [[ "$SKIP_PULL" -eq 1 ]] && runtime_inspect "$RUNTIME" "$ZOT_IMAGE_REF"; then
     warn "Skipping Zot image pull (--skip-pull); image already present"
   else
     if [[ "$SKIP_PULL" -eq 1 ]]; then
@@ -285,7 +299,7 @@ if [[ "$WITH_ZOT" -eq 1 ]]; then
   fi
 
   info "Saving Zot image -> ${ARTIFACTS_DIR}/zot-images.tar"
-  "$RUNTIME" save -o "${ARTIFACTS_DIR}/zot-images.tar" "$ZOT_IMAGE_REF"
+  runtime_save "$RUNTIME" "${ARTIFACTS_DIR}/zot-images.tar" "$ZOT_IMAGE_REF"
 
   # Also download the native Zot binary (useful when container runtimes cannot
   # start privileged overlay mounts, or for bastion-only registries).
