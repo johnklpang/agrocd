@@ -31,7 +31,8 @@
 #                           images are loaded into the local runtime only.
 #   --registry-user USER    Registry username (env: PRIVATE_REGISTRY_USER)
 #   --registry-pass PASS    Registry password (env: PRIVATE_REGISTRY_PASSWORD)
-#   --insecure-registry     Pass --insecure / skip TLS verify when pushing
+#   --insecure-registry     Use plain HTTP to the registry (required for typical
+#                           lab Zot without TLS, e.g. zot-registry:30001)
 #   --mode MODE             load | push | load-and-push  (default: auto)
 #                             auto = push if --registry set, else load
 #   --values FILE           Extra Helm values file(s); may be repeated
@@ -43,9 +44,9 @@
 #   --dry-run               Render / plan only; do not install
 #   --skip-helm             Only load/push images; skip Helm install
 #   --rewrite-mode MODE     keep-path | flatten  (default: keep-path)
-#   --use-zot               Use the local Zot registry started by
-#                           03-zot-registry.sh (reads artifacts/zot.env).
-#                           Sets PRIVATE_REGISTRY + insecure HTTP pushes.
+#   --use-zot               Use Zot via artifacts/zot.env (sets insecure HTTP).
+#                           For an *existing* Zot, prefer:
+#                             --registry zot-registry:30001 --insecure-registry
 #   -h, --help              Show help
 # =============================================================================
 
@@ -115,15 +116,20 @@ export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
 # ---------------------------------------------------------------------------
 # Zot integration: load artifacts/zot.env produced by 03-zot-registry.sh
+# For an existing Zot (e.g. zot-registry:30001), skip --use-zot and pass:
+#   --registry zot-registry:30001 --insecure-registry
 # ---------------------------------------------------------------------------
 if [[ "$USE_ZOT" -eq 1 ]]; then
   ZOT_ENV="${ARTIFACTS_DIR}/zot.env"
-  if [[ ! -f "$ZOT_ENV" ]]; then
-    die "--use-zot requires ${ZOT_ENV}. Start Zot first: ./scripts/03-zot-registry.sh start"
+  if [[ -f "$ZOT_ENV" ]]; then
+    info "Loading Zot registry settings from ${ZOT_ENV}"
+    load_manifest "$ZOT_ENV"
+    PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
+  elif [[ -n "$PRIVATE_REGISTRY" ]]; then
+    info "--use-zot with PRIVATE_REGISTRY=${PRIVATE_REGISTRY} (no zot.env; existing registry)"
+  else
+    die "--use-zot requires ${ZOT_ENV} or --registry / PRIVATE_REGISTRY. For existing Zot: --registry zot-registry:30001 --insecure-registry"
   fi
-  info "Loading Zot registry settings from ${ZOT_ENV}"
-  load_manifest "$ZOT_ENV"
-  PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
   [[ -n "$PRIVATE_REGISTRY" ]] || die "zot.env did not define PRIVATE_REGISTRY"
   # Lab Zot speaks plain HTTP by default
   INSECURE_REGISTRY=1
