@@ -162,14 +162,14 @@ ensure_zot_image_loaded() {
 
   if [[ -f "$ZOT_IMAGES_TAR" ]]; then
     info "Loading Zot image archive ${ZOT_IMAGES_TAR}"
-    "$runtime" load -i "$ZOT_IMAGES_TAR"
+    runtime_load "$runtime" "$ZOT_IMAGES_TAR"
     return
   fi
 
   # Last resort: try the combined Argo image tar (may include zot if --with-zot merged)
   if [[ -f "$IMAGES_TAR" ]] && grep -qxF "$image" "$IMAGES_LIST" 2>/dev/null; then
     info "Loading combined image archive ${IMAGES_TAR}"
-    "$runtime" load -i "$IMAGES_TAR"
+    runtime_load "$runtime" "$IMAGES_TAR"
     return
   fi
 
