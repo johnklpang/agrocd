@@ -1,0 +1,50 @@
+# =============================================================================
+# values-airgap.yaml — in-cluster Zot registry (air-gapped)
+#
+# Image repository/tag are overridden at install time by 03-zot-registry.sh
+# after images have been loaded / pushed locally.
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/project-zot/zot
+  pullPolicy: IfNotPresent
+  # tag is set from the packaged appVersion / image list at deploy time
+
+service:
+  # NodePort makes the registry reachable from cluster nodes and the bastion
+  # without an ingress controller. Switch to ClusterIP + Ingress if preferred.
+  type: NodePort
+  port: 5000
+  # Optionally pin a nodePort:
+  # nodePort: 30500
+
+persistence:
+  enabled: true
+  size: 20Gi
+  # storageClass: ""
+
+# Plain HTTP is typical for lab / air-gapped Zot. Enable TLS for production.
+mountConfig: true
+configFiles:
+  config.json: |
+    {
+      "distSpecVersion": "1.1.0",
+      "storage": { "rootDirectory": "/var/lib/registry" },
+      "http": {
+        "address": "0.0.0.0",
+        "port": "5000",
+        "realm": "zot",
+        "readTimeout": "60s",
+        "writeTimeout": "60s"
+      },
+      "log": { "level": "info" }
+    }
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
