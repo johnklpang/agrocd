@@ -1,0 +1,62 @@
+# =============================================================================
+# values-airgap.yaml
+#
+# Operator overrides for air-gapped Argo CD installs.
+# Image repository/tag overrides are generated at deploy time by
+# scripts/02-airgap-deploy.sh into artifacts/values-generated-airgap.yaml.
+#
+# This file is layered ON TOP of the generated values (higher precedence).
+# Use it for cluster-specific settings that should survive re-runs.
+# =============================================================================
+
+## High availability / replicas (keep modest for air-gapped lab clusters)
+controller:
+  replicas: 1
+
+server:
+  replicas: 1
+  # Insecure mode is useful behind an internal TLS-terminating ingress.
+  # Leave false in production and terminate TLS at the ingress / load balancer.
+  insecure: false
+  service:
+    type: ClusterIP
+
+repoServer:
+  replicas: 1
+
+applicationSet:
+  replicas: 1
+
+## Dex is enabled by default in the upstream chart; keep it unless you SSO elsewhere.
+dex:
+  enabled: true
+
+## Single-instance Redis (default). Enable redis-ha only if you also mirrored
+## redis-ha / haproxy / exporter images during the online phase.
+redis:
+  enabled: true
+
+redis-ha:
+  enabled: false
+
+## CRDs: install from the chart (recommended for air-gap; no remote fetch).
+crds:
+  install: true
+  keep: true
+
+## ConfigMap / parameter overrides suitable for disconnected environments.
+configs:
+  cm:
+    # Optionally pin the external URL once you know the in-cluster address:
+    # url: https://argocd.internal.example
+    admin.enabled: "true"
+
+## Resource requests — tune for your air-gapped cluster capacity.
+## Uncomment and adjust as needed.
+# server:
+#   resources:
+#     requests:
+#       cpu: 100m
+#       memory: 128Mi
+#     limits:
+#       memory: 512Mi

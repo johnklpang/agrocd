@@ -1,0 +1,4 @@
+# Generated transfer artifacts (chart packages, image tars, manifests).
+# Keep the directory; ignore its contents except this file.
+*
+!.gitignore
