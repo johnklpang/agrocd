@@ -23,8 +23,8 @@ argocd-airgap/
 
 | Phase | Tools |
 |-------|--------|
-| Online | `helm` (≥ 3.8), `docker`/`podman`/`nerdctl`, optional `crane` |
-| Air-gapped | Same runtime, `curl`; `kubectl`+`helm` for cluster install. **`skopeo` recommended** for OCI pushes to Zot (avoids Docker schema2 HTTP 415). Optional: `crane` |
+| Online | `helm` (≥ 3.8), `docker`/`podman`/`nerdctl`/`ctr`, optional `crane`/`skopeo` |
+| Air-gapped | Same runtime, `curl`; `kubectl`+`helm` for cluster install. **`skopeo` recommended** for OCI pushes to Zot. Optional: `crane` |
 
 ## Recommended flow (with Zot)
 
@@ -35,7 +35,10 @@ cd argocd-airgap
 chmod +x scripts/*.sh
 
 ./scripts/01-online-prepare.sh --with-zot
-# optional: --pull-tool crane
+# Prefer containerd ctr for pulls:
+#   ./scripts/01-online-prepare.sh --with-zot --runtime ctr --pull-tool ctr
+#   ./scripts/01-online-prepare.sh --with-zot --pull-tool ctr   # pull via ctr, save via docker/etc
+# optional: --ctr-namespace k8s.io
 ```
 
 This pulls the Argo CD chart/images **and**:
@@ -43,6 +46,34 @@ This pulls the Argo CD chart/images **and**:
 - Zot container image → `artifacts/zot-images.tar`
 - Zot Helm chart → `artifacts/zot-*.tgz`
 - Zot config/values → `artifacts/zot/`
+
+### Using `ctr` (containerd) to download images
+
+```bash
+# Full ctr workflow (pull + export into the transfer tar)
+export CTR_NAMESPACE=k8s.io   # kubelet namespace (default)
+./scripts/01-online-prepare.sh --runtime ctr --pull-tool ctr
+
+# Or only use ctr for downloads, keep docker/podman for packaging:
+./scripts/01-online-prepare.sh --pull-tool ctr
+
+# Air-gapped: import the tar into containerd (visible to kubelet)
+./scripts/02-airgap-deploy.sh --runtime ctr --use-zot --artifacts ./artifacts
+# Equivalent manual import:
+#   ctr -n k8s.io images import artifacts/argo-cd-images.tar
+```
+
+`ctr` notes:
+
+| Item | Detail |
+|------|--------|
+| Pull | `ctr -n k8s.io images pull [--platform linux/amd64] <ref>` |
+| Export | `ctr -n k8s.io images export argo-cd-images.tar <refs…>` |
+| Import | `ctr -n k8s.io images import argo-cd-images.tar` |
+| HTTP registry | `--plain-http` (set automatically with `--use-zot` / `--insecure-registry`) |
+| Namespace | Default `k8s.io` so kubelet can see imported images; override with `--ctr-namespace` |
+| Unpack fallback | If overlay whiteouts fail on the bastion, import retries with `--no-unpack` (content still exportable/pushable; cluster nodes unpack normally) |
+| Env | `CTR_NAMESPACE`, `CTR_ADDRESS`, `CTR_PLATFORM`, `CTR_NO_UNPACK=1` |
 
 ### 2. Transfer
 
@@ -155,7 +186,10 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 | `--zot-image REF` | Override Zot image reference |
 | `--zot-chart-version V` | Pin Zot Helm chart version |
 | `--chart-version VER` | Pin Argo CD Helm chart version |
-| `--pull-tool auto\|runtime\|crane` | Image pull strategy |
+| `--runtime NAME` | `docker` \| `podman` \| `nerdctl` \| `ctr` |
+| `--pull-tool auto\|runtime\|crane\|ctr` | Image pull strategy (`ctr` = `ctr images pull`) |
+| `--ctr-namespace NS` | containerd namespace (default `k8s.io`) |
+| `--ctr-address PATH` | containerd socket path |
 | `--skip-pull` | Re-package images already present locally |
 
 ### `02-airgap-deploy.sh`
@@ -164,9 +198,11 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 |------------|-------------|
 | `--use-zot` | Use Zot via `artifacts/zot.env` (sets registry + insecure HTTP) |
 | `--registry` / `PRIVATE_REGISTRY` | Explicit registry host[:port] |
+| `--runtime NAME` | `docker` \| `podman` \| `nerdctl` \| `ctr` |
+| `--ctr-namespace NS` | containerd namespace (default `k8s.io`) |
 | `--mode` | `auto`, `load`, `push`, `load-and-push` |
 | `--rewrite-mode` | `keep-path` (default) or `flatten` |
-| `--insecure-registry` | Skip TLS verify / HTTP registry pushes |
+| `--insecure-registry` | Skip TLS verify / HTTP registry pushes (`ctr --plain-http`) |
 | `--skip-helm` | Only load/push images |
 
 ### Image rewrite modes
