@@ -41,6 +41,9 @@
 #   --dry-run               Render / plan only; do not install
 #   --skip-helm             Only load/push images; skip Helm install
 #   --rewrite-mode MODE     keep-path | flatten  (default: keep-path)
+#   --use-zot               Use the local Zot registry started by
+#                           03-zot-registry.sh (reads artifacts/zot.env).
+#                           Sets PRIVATE_REGISTRY + insecure HTTP pushes.
 #   -h, --help              Show help
 # =============================================================================
 
@@ -58,18 +61,19 @@ RELEASE_NAME="${RELEASE_NAME:-argocd}"
 PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-}"
 PRIVATE_REGISTRY_USER="${PRIVATE_REGISTRY_USER:-}"
 PRIVATE_REGISTRY_PASSWORD="${PRIVATE_REGISTRY_PASSWORD:-}"
-INSECURE_REGISTRY=0
+INSECURE_REGISTRY="${INSECURE_REGISTRY:-0}"
 MODE="${MODE:-auto}"
 RUNTIME="${CONTAINER_RUNTIME:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-10m}"
 DRY_RUN=0
 SKIP_HELM=0
+USE_ZOT=0
 REGISTRY_REWRITE_MODE="${REGISTRY_REWRITE_MODE:-keep-path}"
 EXTRA_VALUES=()
 
 usage() {
-  sed -n '2,48p' "$0" | sed 's/^# \?//'
+  sed -n '2,50p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -93,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)           DRY_RUN=1; shift ;;
     --skip-helm)         SKIP_HELM=1; shift ;;
     --rewrite-mode)      REGISTRY_REWRITE_MODE="$2"; shift 2 ;;
+    --use-zot)           USE_ZOT=1; shift ;;
     -h|--help)           usage ;;
     *) die "Unknown argument: $1 (use --help)" ;;
   esac
@@ -101,6 +106,23 @@ done
 resolve_roots
 [[ -n "$RUNTIME" ]] && CONTAINER_RUNTIME="$RUNTIME"
 export REGISTRY_REWRITE_MODE
+
+# ---------------------------------------------------------------------------
+# Zot integration: load artifacts/zot.env produced by 03-zot-registry.sh
+# ---------------------------------------------------------------------------
+if [[ "$USE_ZOT" -eq 1 ]]; then
+  ZOT_ENV="${ARTIFACTS_DIR}/zot.env"
+  if [[ ! -f "$ZOT_ENV" ]]; then
+    die "--use-zot requires ${ZOT_ENV}. Start Zot first: ./scripts/03-zot-registry.sh start"
+  fi
+  info "Loading Zot registry settings from ${ZOT_ENV}"
+  load_manifest "$ZOT_ENV"
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
+  [[ -n "$PRIVATE_REGISTRY" ]] || die "zot.env did not define PRIVATE_REGISTRY"
+  # Lab Zot speaks plain HTTP by default
+  INSECURE_REGISTRY=1
+  info "Using Zot registry: ${PRIVATE_REGISTRY} (insecure HTTP pushes enabled)"
+fi
 
 # Resolve mode
 case "$MODE" in
@@ -230,22 +252,7 @@ push_images() {
 # full mapping for operators.
 # ---------------------------------------------------------------------------
 # Split an image reference into repository + tag (best-effort).
-# Sets globals: _img_repo _img_tag
-split_image_ref() {
-  local ref="$1"
-  _img_tag=""
-  if [[ "$ref" == *"@"* ]]; then
-    _img_repo="${ref%%@*}"
-    return
-  fi
-  local last="${ref##*/}"
-  if [[ "$last" == *":"* ]]; then
-    _img_tag="${ref##*:}"
-    _img_repo="${ref%:*}"
-  else
-    _img_repo="$ref"
-  fi
-}
+# Sets globals: _img_repo _img_tag  — provided by lib/common.sh as split_image_ref
 
 generate_airgap_values() {
   local out_file="$1"
@@ -304,7 +311,7 @@ generate_airgap_values() {
     echo "    repository: ${argocd_repo}"
     [[ -n "$argocd_tag" ]] && echo "    tag: \"${argocd_tag}\""
     echo "    imagePullPolicy: IfNotPresent"
-    if [[ -n "${PRIVATE_REGISTRY_USER}" ]]; then
+    if [[ -n "${PRIVATE_REGISTRY_USER:-}" ]]; then
       echo "  imagePullSecrets:"
       echo "    - name: argocd-registry-secret"
     fi

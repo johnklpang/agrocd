@@ -110,12 +110,25 @@ _pull_with_crane() {
 
 # ---------------------------------------------------------------------------
 # Push a single image reference already present in the local runtime.
-# Prefer crane when available for registry push reliability.
+# Prefer skopeo with --format=oci — Zot rejects Docker schema2 manifests (HTTP 415).
+# Fall back to crane, then the runtime's native push.
 # ---------------------------------------------------------------------------
 push_image() {
   local runtime="$1"
   local image="$2"
   local insecure="${3:-0}"
+
+  if command -v skopeo >/dev/null 2>&1; then
+    local src dest_tls=true
+    case "$runtime" in
+      podman) src="containers-storage:${image}" ;;
+      *)      src="docker-daemon:${image}" ;;
+    esac
+    [[ "$insecure" -eq 1 ]] && dest_tls=false
+    info "skopeo copy (oci) ${image}"
+    skopeo copy --format=oci --dest-tls-verify="$dest_tls" "$src" "docker://${image}"
+    return
+  fi
 
   if command -v crane >/dev/null 2>&1; then
     local tmp crane_args=(push)
@@ -127,12 +140,18 @@ push_image() {
       rm -f "$tmp"
       die "Failed to save ${image} for crane push"
     fi
+    warn "skopeo not found; crane may fail against Zot (Docker schema2 → HTTP 415). Install skopeo for OCI pushes."
     if ! crane "${crane_args[@]}" "$tmp" "$image"; then
       rm -f "$tmp"
       die "crane push failed for ${image}"
     fi
     rm -f "$tmp"
     return
+  fi
+
+  if [[ "$insecure" -eq 1 ]]; then
+    warn "Pushing to an HTTP/insecure registry without skopeo/crane."
+    warn "Ensure the runtime allows insecure registries (e.g. Docker insecure-registries)."
   fi
 
   local push_args=(push)
@@ -259,6 +278,26 @@ rewrite_image() {
       echo "${registry}/${path}${tag}${digest}"
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Split an image reference into repository + tag (best-effort).
+# Sets globals: _img_repo _img_tag
+# ---------------------------------------------------------------------------
+split_image_ref() {
+  local ref="$1"
+  _img_tag=""
+  if [[ "$ref" == *"@"* ]]; then
+    _img_repo="${ref%%@*}"
+    return
+  fi
+  local last="${ref##*/}"
+  if [[ "$last" == *":"* ]]; then
+    _img_tag="${ref##*:}"
+    _img_repo="${ref%:*}"
+  else
+    _img_repo="$ref"
+  fi
 }
 
 # ---------------------------------------------------------------------------

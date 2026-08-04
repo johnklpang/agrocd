@@ -1,10 +1,12 @@
-# Argo CD air-gapped Helm deployment workflow
+# Argo CD air-gapped Helm deployment workflow (with local Zot OCI registry)
 #
 # Online (connected) host:
-#   1. Run scripts/01-online-prepare.sh to pull the chart + images.
-#   2. Transfer the artifacts/ directory (or argo-cd-airgap-bundle.tar) offline.
+#   ./argocd-airgap/scripts/01-online-prepare.sh --with-zot
+#
+# Transfer the argocd-airgap/ tree (or artifacts + scripts + zot + helm).
 #
 # Air-gapped host:
-#   3. Run scripts/02-airgap-deploy.sh to load/push images and helm upgrade --install.
+#   ./argocd-airgap/scripts/03-zot-registry.sh start
+#   ./argocd-airgap/scripts/02-airgap-deploy.sh --use-zot
 #
 # See argocd-airgap/README.md for full instructions.
