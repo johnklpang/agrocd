@@ -38,7 +38,7 @@
 #   --config FILE         Zot config.json (default: ./zot/config.json)
 #   --binary PATH         Path to zot binary (default: artifacts/zot-bin/zot-linux-amd64)
 #   --registry HOST:PORT  Override advertised registry address
-#                         (default: 127.0.0.1:$PORT for container/binary,
+#                         (default: 192.168.56.10:$PORT for container/binary,
 #                          <node-ip>:<nodePort> or svc for helm)
 #   --image REF           Zot image override (default: from artifacts/zot-images.txt
 #                         or ghcr.io/project-zot/zot:latest)
@@ -58,7 +58,7 @@ COMMAND=""
 BACKEND="${ZOT_BACKEND:-container}"
 ZOT_NAME="${ZOT_NAME:-zot}"
 ZOT_NAMESPACE="${ZOT_NAMESPACE:-zot}"
-ZOT_PORT="${ZOT_PORT:-5000}"
+ZOT_PORT="${ZOT_PORT:-${DEFAULT_ZOT_PORT}}"
 ZOT_DATA_DIR="${ZOT_DATA_DIR:-}"
 ZOT_CONFIG="${ZOT_CONFIG:-}"
 ZOT_IMAGE="${ZOT_IMAGE:-}"
@@ -225,7 +225,8 @@ container_addr() {
   if [[ -n "$ZOT_REGISTRY_OVERRIDE" ]]; then
     echo "$ZOT_REGISTRY_OVERRIDE"
   else
-    echo "127.0.0.1:${ZOT_PORT}"
+    # Cluster-reachable LAN IP so kubelet on workers can pull (not 127.0.0.1).
+    echo "${DEFAULT_ZOT_HOST}:${ZOT_PORT}"
   fi
 }
 

@@ -5,6 +5,15 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# Default Zot registry (cluster-reachable LAN address)
+# Advertise this host:port in zot.env / Helm values so workers can pull.
+# Override with --registry / PRIVATE_REGISTRY when needed.
+# ---------------------------------------------------------------------------
+DEFAULT_ZOT_HOST="${DEFAULT_ZOT_HOST:-192.168.56.10}"
+DEFAULT_ZOT_PORT="${DEFAULT_ZOT_PORT:-5000}"
+DEFAULT_ZOT_REGISTRY="${DEFAULT_ZOT_REGISTRY:-${DEFAULT_ZOT_HOST}:${DEFAULT_ZOT_PORT}}"
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 log()  { printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
@@ -349,7 +358,7 @@ _pull_with_crane() {
 # Fall back to ctr --plain-http, then crane --insecure.
 # ---------------------------------------------------------------------------
 
-# Host[:port] from an image reference (zot-registry:30001/foo/bar:tag → zot-registry:30001)
+# Host[:port] from an image reference (192.168.56.10:5000/foo/bar:tag → 192.168.56.10:5000)
 image_registry_host() {
   local image="$1"
   echo "${image%%/*}"

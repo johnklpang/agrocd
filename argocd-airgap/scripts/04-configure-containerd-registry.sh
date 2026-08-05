@@ -3,19 +3,19 @@
 # 04-configure-containerd-registry.sh
 #
 # Configure containerd/kubelet on THIS node to pull from a plain-HTTP registry
-# such as Zot (e.g. zot-registry:30001).
+# such as Zot (e.g. 192.168.56.10:5000).
 #
 # Symptom this fixes:
-#   Failed to pull image "zot-registry:30001/...":
-#   Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
+#   Failed to pull image "192.168.56.10:5000/...":
+#   Head "https://192.168.56.10:5000/v2/...": http: server gave HTTP response to HTTPS client
 #
 # Run on EVERY Kubernetes node (masters and workers), then restart pods:
 #   kubectl -n argocd delete pods --all
 #
 # Usage:
-#   sudo ./scripts/04-configure-containerd-registry.sh apply --registry zot-registry:30001
-#   sudo ./scripts/04-configure-containerd-registry.sh show --registry zot-registry:30001
-#   ./scripts/04-configure-containerd-registry.sh print --registry zot-registry:30001
+#   sudo ./scripts/04-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
+#   sudo ./scripts/04-configure-containerd-registry.sh show --registry 192.168.56.10:5000
+#   ./scripts/04-configure-containerd-registry.sh print --registry 192.168.56.10:5000
 #
 # Commands:
 #   apply   Write hosts.toml (+ ensure config_path) and restart containerd
@@ -24,7 +24,7 @@
 #   verify  Probe http://REGISTRY/v2/ and check config files exist
 #
 # Options:
-#   --registry HOST:PORT   Registry address (default: zot-registry:30001
+#   --registry HOST:PORT   Registry address (default: 192.168.56.10:5000
 #                          or PRIVATE_REGISTRY / ZOT_REGISTRY env)
 #   --certs-dir DIR        containerd certs.d root (default: /etc/containerd/certs.d)
 #   --config FILE          containerd config.toml (default: /etc/containerd/config.toml)
@@ -40,7 +40,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 
 COMMAND=""
-REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-zot-registry:30001}}"
+REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-${DEFAULT_ZOT_REGISTRY}}}"
 CERTS_DIR="${CONTAINERD_CERTS_DIR:-/etc/containerd/certs.d}"
 CONTAINERD_CONFIG="${CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
 RESTART=1
