@@ -75,20 +75,23 @@ tar -xvf argo-cd-airgap-bundle.tar
 cd argocd-airgap
 ```
 
-### 3. Air-gapped — configure nodes, then push and install
+### 3. Air-gapped — force plain HTTP (not HTTPS), then install
 
-`--insecure-registry` only affects **push** (skopeo/ctr). **Kubelet on every node** still needs its own HTTP registry config, or you get:
+Zot at `http://zot-registry:30001/v2/` is **HTTP only**. Kubelet defaults to **HTTPS**, which fails with:
 
 ```text
-Failed to pull image "zot-registry:30001/argoproj/argocd:v3.5.0":
 Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
 ```
 
+`--insecure-registry` makes the deploy script:
+1. Push over plain HTTP (`ctr --plain-http` / skopeo)
+2. Auto-configure **this node's** containerd for plain HTTP (not HTTPS)
+3. You must still run the same config on **every worker**
+
 ```bash
-# REQUIRED on master + ALL workers (copy script or run via ssh)
+# On EVERY worker (and master if not already done by 02):
 sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry:30001
 
-# Then push images + helm install
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
   --registry zot-registry:30001 \
@@ -96,7 +99,6 @@ sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry
   --redis-secret-init manual \
   --artifacts ./artifacts
 
-# If pods were already ImagePullBackOff, recreate them after configuring workers:
 kubectl -n argocd delete pods --all
 ```
 
