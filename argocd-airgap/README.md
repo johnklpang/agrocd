@@ -75,22 +75,30 @@ tar -xvf argo-cd-airgap-bundle.tar
 cd argocd-airgap
 ```
 
-### 3. Air-gapped — push to registry and install
+### 3. Air-gapped — configure nodes, then push and install
+
+`--insecure-registry` only affects **push** (skopeo/ctr). **Kubelet on every node** still needs its own HTTP registry config, or you get:
+
+```text
+Failed to pull image "zot-registry:30001/argoproj/argocd:v3.5.0":
+Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
+```
 
 ```bash
-# On every node: allow plain-HTTP pulls from the registry
+# REQUIRED on master + ALL workers (copy script or run via ssh)
 sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry:30001
 
+# Then push images + helm install
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
   --registry zot-registry:30001 \
   --insecure-registry \
   --redis-secret-init manual \
   --artifacts ./artifacts
-```
 
-`--insecure-registry` is required for HTTP registries. Without it, skopeo tries HTTPS and fails with:
-`http: server gave HTTP response to HTTPS client`.
+# If pods were already ImagePullBackOff, recreate them after configuring workers:
+kubectl -n argocd delete pods --all
+```
 
 ## Allowing Kubernetes to pull from an HTTP registry
 

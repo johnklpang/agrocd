@@ -433,17 +433,56 @@ print_helm_failure_diagnostics() {
     -l app.kubernetes.io/name=argocd-redis-secret-init \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
 
+  print_http_registry_remediation
+}
+
+# ---------------------------------------------------------------------------
+# Exact fix for:
+#   Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
+# Must be applied on EVERY node (the failing pod may be on a worker).
+# ---------------------------------------------------------------------------
+print_http_registry_remediation() {
+  local reg="${PRIVATE_REGISTRY:-${DEFAULT_PRIVATE_REGISTRY}}"
   cat <<EOF
 
-Common air-gap causes:
-  1) Nodes cannot pull from ${PRIVATE_REGISTRY:-<registry>} over HTTP
-     → configure containerd hosts.toml / Docker insecure-registries for that host
-  2) Stuck redis-secret-init pre-upgrade Job (ImagePullBackOff)
-     → re-run with --redis-secret-init manual (default) which skips the hook
-  3) Previous failed hook Job
-     → kubectl -n ${NAMESPACE} delete job -l app.kubernetes.io/name=argocd-redis-secret-init
+================================================================
+ ImagePullBackOff / HTTPS→HTTP registry fix
+================================================================
+Kubelet is talking HTTPS to an HTTP registry (${reg}).
+
+Run on EVERY node (master + all workers — your pod may be on a worker):
+
+  cd ~/agrocd/argocd-airgap
+  sudo ./scripts/03-configure-containerd-registry.sh apply --registry ${reg}
+
+Confirm on a worker (e.g. k8s-worker3):
+
+  ls -l /etc/containerd/certs.d/${reg}/hosts.toml
+  curl -sS -o /dev/null -w '%{http_code}\\n' http://${reg}/v2/
+
+Then recreate pods:
+
+  kubectl -n ${NAMESPACE} delete pods --all
+  kubectl -n ${NAMESPACE} get pods -w
+
+Other common causes:
+  - Stuck redis-secret-init Job → re-run with --redis-secret-init manual (default)
+  - Delete stuck hook: kubectl -n ${NAMESPACE} delete job -l app.kubernetes.io/name=argocd-redis-secret-init
 
 EOF
+}
+
+# After install/wait, surface ImagePullBackOff with the HTTPS hint if present.
+warn_if_image_pull_https_failure() {
+  [[ -n "${PRIVATE_REGISTRY:-}" ]] || return 0
+  local events
+  events="$(kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get events \
+    --field-selector reason=Failed \
+    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null || true)"
+  if echo "$events" | grep -q 'HTTP response to HTTPS client'; then
+    err "Detected kubelet HTTPS pulls against HTTP registry ${PRIVATE_REGISTRY}"
+    print_http_registry_remediation
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -535,11 +574,13 @@ helm_install() {
   done
 
   # Broader readiness: all pods in namespace with app.kubernetes.io/part-of=argocd
-  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" wait \
+  if ! kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" wait \
     --for=condition=Ready pods \
     -l app.kubernetes.io/part-of=argocd \
-    --timeout="$WAIT_TIMEOUT" \
-    || warn "Some pods not Ready within ${WAIT_TIMEOUT}; check: kubectl -n ${NAMESPACE} get pods"
+    --timeout="$WAIT_TIMEOUT"; then
+    warn "Some pods not Ready within ${WAIT_TIMEOUT}; check: kubectl -n ${NAMESPACE} get pods"
+    warn_if_image_pull_https_failure
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -568,6 +609,17 @@ Useful status commands:
   kubectl ${KUBECTL_CTX_ARGS[*]+"${KUBECTL_CTX_ARGS[*]}"} -n ${NAMESPACE} get pods
 
 EOF
+
+  if [[ -n "${PRIVATE_REGISTRY:-}" && "$INSECURE_REGISTRY" -eq 1 ]]; then
+    cat <<EOF
+HTTP registry reminder (${PRIVATE_REGISTRY}):
+  Pushing with --insecure-registry is NOT enough for kubelet.
+  Every node needs containerd hosts.toml or pods stay in ImagePullBackOff:
+
+    sudo ./scripts/03-configure-containerd-registry.sh apply --registry ${PRIVATE_REGISTRY}
+
+EOF
+  fi
 }
 
 # ---------------------------------------------------------------------------
