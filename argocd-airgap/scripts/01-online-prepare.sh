@@ -30,10 +30,6 @@
 #                         ctr:  always download with containerd `ctr images pull`
 #   --ctr-namespace NS    containerd namespace for ctr (default: k8s.io)
 #   --ctr-address PATH    containerd socket (default: /run/containerd/containerd.sock)
-#   --with-zot            Also pull the Zot registry image + Helm chart for
-#                         use as the air-gapped local OCI registry
-#   --zot-image REF       Override Zot image (default: ghcr.io/project-zot/zot)
-#   --zot-chart-version V Pin Zot Helm chart version (default: latest)
 #   -h, --help            Show help
 #
 # Transfer to the air-gapped network:
@@ -63,15 +59,9 @@ VALUES_FILE="${VALUES_FILE:-}"
 SKIP_PULL=0
 RUNTIME="${CONTAINER_RUNTIME:-}"
 PULL_TOOL="${PULL_TOOL:-auto}"
-WITH_ZOT="${WITH_ZOT:-0}"
-ZOT_IMAGE_REPO="${ZOT_IMAGE_REPO:-ghcr.io/project-zot/zot}"
-ZOT_IMAGE_REF="${ZOT_IMAGE_REF:-}"
-ZOT_CHART_VERSION="${ZOT_CHART_VERSION:-}"
-ZOT_HELM_REPO_URL="${ZOT_HELM_REPO_URL:-https://zotregistry.dev/helm-charts}"
-ZOT_HELM_REPO_NAME="${ZOT_HELM_REPO_NAME:-project-zot}"
 
 usage() {
-  sed -n '2,50p' "$0" | sed 's/^# \?//'
+  sed -n '2,46p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -91,9 +81,8 @@ while [[ $# -gt 0 ]]; do
     --pull-tool)     PULL_TOOL="$2"; shift 2 ;;
     --ctr-namespace) CTR_NAMESPACE="$2"; shift 2 ;;
     --ctr-address)   CTR_ADDRESS="$2"; shift 2 ;;
-    --with-zot)      WITH_ZOT=1; shift ;;
-    --zot-image)     ZOT_IMAGE_REF="$2"; shift 2 ;;
-    --zot-chart-version) ZOT_CHART_VERSION="$2"; shift 2 ;;
+    --with-zot|--zot-image|--zot-chart-version)
+      die "Zot packaging was removed. Use an existing private registry with 02-airgap-deploy.sh --registry HOST:PORT" ;;
     -h|--help)       usage ;;
     *) die "Unknown argument: $1 (use --help)" ;;
   esac
@@ -130,12 +119,11 @@ if [[ "$RUNTIME" == "ctr" || "$PULL_TOOL" == "ctr" ]]; then
   info "ctr namespace       : ${CTR_NAMESPACE}"
   info "ctr address         : ${CTR_ADDRESS:-/run/containerd/containerd.sock (default)}"
 fi
-info "Include Zot registry: $([[ "$WITH_ZOT" -eq 1 ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 # 1. Add / update Helm repository and pull chart
 # ---------------------------------------------------------------------------
-section "1/6 Add Helm repository and pull chart"
+section "1/5 Add Helm repository and pull chart"
 
 info "Adding Helm repository '${HELM_REPO_NAME}'..."
 helm repo add "$HELM_REPO_NAME" "$HELM_REPO_URL" --force-update
@@ -172,7 +160,7 @@ info "Resolved chart version=${CHART_VERSION_RESOLVED} appVersion=${APP_VERSION}
 # ---------------------------------------------------------------------------
 # 2. Extract container images via helm template (no hardcoded tags)
 # ---------------------------------------------------------------------------
-section "2/6 Extract container images from chart"
+section "2/5 Extract container images from chart"
 
 TEMPLATE_ARGS=()
 if [[ -n "$VALUES_FILE" ]]; then
@@ -204,7 +192,7 @@ done
 # ---------------------------------------------------------------------------
 # 3. Pull images
 # ---------------------------------------------------------------------------
-section "3/6 Pull container images"
+section "3/5 Pull container images"
 
 if [[ "$SKIP_PULL" -eq 1 ]]; then
   warn "Skipping image pull (--skip-pull). Images must already exist locally."
@@ -219,7 +207,7 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Save images into a single tar archive
 # ---------------------------------------------------------------------------
-section "4/6 Package images into tar archive"
+section "4/5 Package images into tar archive"
 
 info "Saving ${#IMAGES[@]} image(s) -> ${IMAGES_TAR}"
 runtime_save "$RUNTIME" "$IMAGES_TAR" "${IMAGES[@]}"
@@ -229,126 +217,9 @@ IMAGES_TAR_SIZE="$(du -h "$IMAGES_TAR" | awk '{print $1}')"
 info "Image archive size: ${IMAGES_TAR_SIZE}"
 
 # ---------------------------------------------------------------------------
-# 5. Optional: package Zot (local OCI registry) for air-gapped use
+# 5. Write transfer manifest
 # ---------------------------------------------------------------------------
-if [[ "$WITH_ZOT" -eq 1 ]]; then
-  section "5/6 Package Zot local registry image + chart"
-
-  info "Adding Zot Helm repository '${ZOT_HELM_REPO_NAME}'..."
-  helm repo add "$ZOT_HELM_REPO_NAME" "$ZOT_HELM_REPO_URL" --force-update || \
-    warn "Helm repo add failed for ${ZOT_HELM_REPO_URL}; will try OCI pull"
-  helm repo update "$ZOT_HELM_REPO_NAME" 2>/dev/null || true
-
-  rm -f "${ARTIFACTS_DIR}/zot"-*.tgz
-  ZOT_CHART_TGZ=""
-  if helm pull "${ZOT_HELM_REPO_NAME}/zot" --destination "$ARTIFACTS_DIR" \
-      ${ZOT_CHART_VERSION:+--version "$ZOT_CHART_VERSION"}; then
-    mapfile -t ZOT_PKGS < <(ls -1t "${ARTIFACTS_DIR}/zot"-*.tgz 2>/dev/null || true)
-    if ((${#ZOT_PKGS[@]} > 0)); then
-      ZOT_CHART_TGZ="${ZOT_PKGS[0]}"
-    fi
-  fi
-
-  if [[ -z "$ZOT_CHART_TGZ" ]]; then
-    info "Falling back to OCI chart pull oci://ghcr.io/project-zot/helm-charts/zot"
-    local_oci_args=(pull oci://ghcr.io/project-zot/helm-charts/zot --destination "$ARTIFACTS_DIR")
-    [[ -n "$ZOT_CHART_VERSION" ]] && local_oci_args+=(--version "$ZOT_CHART_VERSION")
-    helm "${local_oci_args[@]}"
-    mapfile -t ZOT_PKGS < <(ls -1t "${ARTIFACTS_DIR}/zot"-*.tgz 2>/dev/null || true)
-    ((${#ZOT_PKGS[@]} > 0)) || die "Failed to pull Zot Helm chart"
-    ZOT_CHART_TGZ="${ZOT_PKGS[0]}"
-  fi
-  info "Zot chart package: ${ZOT_CHART_TGZ}"
-
-  # Resolve image from chart values / appVersion when not overridden
-  ZOT_UNTAR="${ARTIFACTS_DIR}/zot-chart"
-  rm -rf "$ZOT_UNTAR"
-  mkdir -p "$ZOT_UNTAR"
-  tar -xzf "$ZOT_CHART_TGZ" -C "$ZOT_UNTAR"
-  ZOT_CHART_DIR="$(find "$ZOT_UNTAR" -mindepth 1 -maxdepth 1 -type d | head -1)"
-  ZOT_CHART_VER="$(awk '/^version:/{print $2; exit}' "${ZOT_CHART_DIR}/Chart.yaml")"
-  ZOT_APP_VER="$(awk '/^appVersion:/{gsub(/"/,""); print $2; exit}' "${ZOT_CHART_DIR}/Chart.yaml")"
-
-  if [[ -z "$ZOT_IMAGE_REF" ]]; then
-    # Prefer image.repository + image.tag from values.yaml; fall back to appVersion
-    zot_repo="$(awk '
-      /^image:/{inimage=1; next}
-      inimage && /^[^ ]/{inimage=0}
-      inimage && /repository:/{gsub(/"/,""); print $2; exit}
-    ' "${ZOT_CHART_DIR}/values.yaml" 2>/dev/null || true)"
-    zot_tag="$(awk '
-      /^image:/{inimage=1; next}
-      inimage && /^[^ ]/{inimage=0}
-      inimage && /tag:/{gsub(/"/,""); print $2; exit}
-    ' "${ZOT_CHART_DIR}/values.yaml" 2>/dev/null || true)"
-    [[ -z "$zot_repo" ]] && zot_repo="$ZOT_IMAGE_REPO"
-    [[ -z "$zot_tag" || "$zot_tag" == "\"\"" ]] && zot_tag="$ZOT_APP_VER"
-    ZOT_IMAGE_REF="${zot_repo}:${zot_tag}"
-  fi
-  info "Zot image: ${ZOT_IMAGE_REF} (chart ${ZOT_CHART_VER}, app ${ZOT_APP_VER})"
-
-  printf '%s\n' "$ZOT_IMAGE_REF" >"${ARTIFACTS_DIR}/zot-images.txt"
-
-  if [[ "$SKIP_PULL" -eq 1 ]] && runtime_inspect "$RUNTIME" "$ZOT_IMAGE_REF"; then
-    warn "Skipping Zot image pull (--skip-pull); image already present"
-  else
-    if [[ "$SKIP_PULL" -eq 1 ]]; then
-      warn "Zot image not present locally; pulling despite --skip-pull"
-    fi
-    pull_image "$RUNTIME" "$ZOT_IMAGE_REF"
-  fi
-
-  info "Saving Zot image -> ${ARTIFACTS_DIR}/zot-images.tar"
-  runtime_save "$RUNTIME" "${ARTIFACTS_DIR}/zot-images.tar" "$ZOT_IMAGE_REF"
-
-  # Also download the native Zot binary (useful when container runtimes cannot
-  # start privileged overlay mounts, or for bastion-only registries).
-  local_arch="$(uname -m)"
-  case "$local_arch" in
-    x86_64|amd64) zot_arch="amd64" ;;
-    aarch64|arm64) zot_arch="arm64" ;;
-    *) zot_arch="amd64"; warn "Unknown arch ${local_arch}; defaulting to amd64 Zot binary" ;;
-  esac
-  ZOT_BIN_DIR="${ARTIFACTS_DIR}/zot-bin"
-  ZOT_BIN_PATH="${ZOT_BIN_DIR}/zot-linux-${zot_arch}"
-  mkdir -p "$ZOT_BIN_DIR"
-  ZOT_BIN_URL="https://github.com/project-zot/zot/releases/download/${ZOT_APP_VER}/zot-linux-${zot_arch}"
-  info "Downloading Zot binary ${ZOT_BIN_URL}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$ZOT_BIN_PATH" "$ZOT_BIN_URL" || warn "Failed to download Zot binary (optional)"
-  else
-    warn "curl not found; skipping Zot binary download"
-  fi
-  if [[ -f "$ZOT_BIN_PATH" ]]; then
-    chmod +x "$ZOT_BIN_PATH"
-    info "Zot binary: ${ZOT_BIN_PATH}"
-  fi
-
-  # Copy Zot config alongside artifacts for the offline host
-  mkdir -p "${ARTIFACTS_DIR}/zot"
-  cp -f "${ROOT_DIR}/zot/config.json" "${ARTIFACTS_DIR}/zot/config.json"
-  cp -f "${ROOT_DIR}/zot/values-airgap.yaml" "${ARTIFACTS_DIR}/zot/values-airgap.yaml"
-
-  cat >"${ARTIFACTS_DIR}/zot-manifest.env" <<EOF
-# Generated by 01-online-prepare.sh --with-zot on $(date -u +'%Y-%m-%dT%H:%M:%SZ')
-ZOT_IMAGE_REF=${ZOT_IMAGE_REF}
-ZOT_CHART_TGZ_BASENAME=$(basename "$ZOT_CHART_TGZ")
-ZOT_CHART_VERSION=${ZOT_CHART_VER}
-ZOT_APP_VERSION=${ZOT_APP_VER}
-ZOT_IMAGES_TAR_BASENAME=zot-images.tar
-ZOT_IMAGES_LIST_BASENAME=zot-images.txt
-ZOT_BINARY_BASENAME=$(basename "$ZOT_BIN_PATH")
-GENERATED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-EOF
-  info "Wrote ${ARTIFACTS_DIR}/zot-manifest.env"
-else
-  section "5/6 Skip Zot packaging (pass --with-zot to include)"
-fi
-
-# ---------------------------------------------------------------------------
-# 6. Write transfer manifest
-# ---------------------------------------------------------------------------
-section "6/6 Write transfer manifest"
+section "5/5 Write transfer manifest"
 
 CHART_TGZ_BASENAME="$(basename "$CHART_TGZ")"
 cat >"$MANIFEST_FILE" <<EOF
@@ -363,7 +234,6 @@ IMAGES_LIST_BASENAME=$(basename "$IMAGES_LIST")
 IMAGE_MAP_BASENAME=$(basename "$IMAGE_MAP")
 IMAGE_COUNT=${#IMAGES[@]}
 HELM_REPO_URL=${HELM_REPO_URL}
-WITH_ZOT=${WITH_ZOT}
 GENERATED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 EOF
 
@@ -384,25 +254,22 @@ Artifacts ready for transfer (copy this entire directory to the air-gapped netwo
     ├── $(basename "$IMAGES_TAR")      # Argo CD container images
     ├── $(basename "$IMAGES_LIST")     # Image list (one per line)
     ├── $(basename "$IMAGE_MAP")       # Image map (TSV)
-    ├── $(basename "$MANIFEST_FILE")   # Versions / filenames
-$(if [[ "$WITH_ZOT" -eq 1 ]]; then
-  echo "    ├── zot-images.tar                 # Zot registry image"
-  echo "    ├── zot-*.tgz                      # Zot Helm chart"
-  echo "    ├── zot-manifest.env               # Zot versions / filenames"
-  echo "    └── zot/config.json                # Zot HTTP registry config"
-fi)
+    └── $(basename "$MANIFEST_FILE")   # Versions / filenames
 
 Suggested transfer:
 
-  # Create a single transfer bundle (include scripts + zot config)
   tar -C "$(dirname "$ROOT_DIR")" -cvf argo-cd-airgap-bundle.tar "$(basename "$ROOT_DIR")"
 
-On the air-gapped host:
+On the air-gapped host (registry already running, e.g. ${DEFAULT_PRIVATE_REGISTRY}):
 
-  # 1) Start local Zot registry (container backend on :5000)
-  ./scripts/03-zot-registry.sh start
+  # Allow kubelet HTTP pulls (every node)
+  sudo ./scripts/03-configure-containerd-registry.sh apply --registry ${DEFAULT_PRIVATE_REGISTRY}
 
-  # 2) Push Argo CD images into Zot and install
-  ./scripts/02-airgap-deploy.sh --use-zot --artifacts ${ARTIFACTS_DIR}
+  # Push images and install Argo CD
+  ./scripts/02-airgap-deploy.sh \\
+    --runtime ctr \\
+    --registry ${DEFAULT_PRIVATE_REGISTRY} \\
+    --insecure-registry \\
+    --artifacts ${ARTIFACTS_DIR}
 
 EOF
