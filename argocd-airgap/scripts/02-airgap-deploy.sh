@@ -52,6 +52,9 @@
 #                           chart pre-install/pre-upgrade Job (avoids hook
 #                           timeouts when nodes cannot pull the Job image yet)
 #                           helm: let the chart Job create the secret
+#   --allow-localhost-registry
+#                           Allow PRIVATE_REGISTRY=127.0.0.1 (single-node only).
+#                           Rejected by default — workers cannot pull localhost.
 #   -h, --help              Show help
 # =============================================================================
 
@@ -110,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --rewrite-mode)      REGISTRY_REWRITE_MODE="$2"; shift 2 ;;
     --use-zot)           USE_ZOT=1; shift ;;
     --redis-secret-init) REDIS_SECRET_INIT="$2"; shift 2 ;;
+    --allow-localhost-registry) ALLOW_LOCALHOST_REGISTRY=1; shift ;;
     -h|--help)           usage ;;
     *) die "Unknown argument: $1 (use --help)" ;;
   esac
@@ -128,15 +132,27 @@ export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
 # ---------------------------------------------------------------------------
 # Zot integration: load artifacts/zot.env produced by 03-zot-registry.sh
-# For an existing Zot (e.g. zot-registry:30001), skip --use-zot and pass:
+# For an existing Zot (e.g. zot-registry:30001), prefer:
 #   --registry zot-registry:30001 --insecure-registry
+# (--registry always wins over zot.env)
 # ---------------------------------------------------------------------------
+ALLOW_LOCALHOST_REGISTRY="${ALLOW_LOCALHOST_REGISTRY:-0}"
+
+# Preserve CLI --registry across zot.env load (load_manifest exports and would overwrite)
+CLI_PRIVATE_REGISTRY="$PRIVATE_REGISTRY"
+
 if [[ "$USE_ZOT" -eq 1 ]]; then
   ZOT_ENV="${ARTIFACTS_DIR}/zot.env"
   if [[ -f "$ZOT_ENV" ]]; then
     info "Loading Zot registry settings from ${ZOT_ENV}"
     load_manifest "$ZOT_ENV"
-    PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
+    # CLI --registry / pre-set PRIVATE_REGISTRY takes precedence over zot.env
+    if [[ -n "$CLI_PRIVATE_REGISTRY" ]]; then
+      PRIVATE_REGISTRY="$CLI_PRIVATE_REGISTRY"
+      info "Keeping --registry ${PRIVATE_REGISTRY} (ignoring PRIVATE_REGISTRY from zot.env)"
+    else
+      PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
+    fi
   elif [[ -n "$PRIVATE_REGISTRY" ]]; then
     info "--use-zot with PRIVATE_REGISTRY=${PRIVATE_REGISTRY} (no zot.env; existing registry)"
   else
@@ -150,6 +166,44 @@ fi
 
 # Propagate insecure flag to pull helpers (after --use-zot may set it)
 export PULL_INSECURE="$INSECURE_REGISTRY"
+
+# ---------------------------------------------------------------------------
+# Guard: 127.0.0.1 / localhost is NOT reachable from other cluster nodes.
+# Helm values with 127.0.0.1:5000 cause ImagePullBackOff on workers:
+#   Pulling image "127.0.0.1:5000/argoproj/argocd:..." → connection refused
+# ---------------------------------------------------------------------------
+is_localhost_registry() {
+  local host="${1%%/*}"
+  host="${host%%:*}"
+  case "$host" in
+    127.0.0.1|localhost|::1|0.0.0.0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+assert_cluster_reachable_registry() {
+  [[ -n "$PRIVATE_REGISTRY" ]] || return 0
+  if is_localhost_registry "$PRIVATE_REGISTRY"; then
+    if [[ "$ALLOW_LOCALHOST_REGISTRY" -eq 1 ]]; then
+      warn "Allowing localhost registry ${PRIVATE_REGISTRY} (--allow-localhost-registry)"
+      warn "This only works for single-node clusters where kubelet shares that loopback."
+      return 0
+    fi
+    die "PRIVATE_REGISTRY='${PRIVATE_REGISTRY}' is localhost — worker nodes cannot pull it.
+
+Pods are scheduled on workers; 127.0.0.1 there is the worker itself, not your Zot.
+Use your cluster-reachable Zot address instead, e.g.:
+
+  ./scripts/02-airgap-deploy.sh \\
+    --runtime ctr \\
+    --registry zot-registry:30001 \\
+    --insecure-registry \\
+    --artifacts ./artifacts
+
+If artifacts/zot.env still says 127.0.0.1:5000, --registry overrides it.
+Only use --allow-localhost-registry for single-node / kind labs."
+  fi
+}
 
 # Resolve mode
 case "$MODE" in
@@ -166,6 +220,12 @@ esac
 
 if [[ "$MODE" == "push" || "$MODE" == "load-and-push" ]]; then
   [[ -n "$PRIVATE_REGISTRY" ]] || die "--registry / PRIVATE_REGISTRY is required for mode=${MODE}"
+fi
+
+# Localhost registries are fine for bastion-side image push into a local Zot,
+# but must not be written into Helm values for a multi-node cluster.
+if [[ "$SKIP_HELM" -eq 0 && -n "$PRIVATE_REGISTRY" ]]; then
+  assert_cluster_reachable_registry
 fi
 
 require_cmds awk sort
