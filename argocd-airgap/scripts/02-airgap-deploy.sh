@@ -31,8 +31,12 @@
 #                           images are loaded into the local runtime only.
 #   --registry-user USER    Registry username (env: PRIVATE_REGISTRY_USER)
 #   --registry-pass PASS    Registry password (env: PRIVATE_REGISTRY_PASSWORD)
-#   --insecure-registry     Use plain HTTP to the registry (required for typical
-#                           lab registries without TLS, e.g. zot-registry:30001)
+#   --insecure-registry     Use plain HTTP (not HTTPS) for registry push AND
+#                           configure local containerd so kubelet also uses HTTP
+#                           (required for zot-registry:30001 and similar)
+#   --skip-containerd-config  Do not auto-run 03-configure-containerd-registry.sh
+#                           when --insecure-registry is set (you must configure
+#                           every node yourself)
 #   --mode MODE             load | push | load-and-push  (default: auto)
 #                             auto = push if --registry set, else load
 #   --values FILE           Extra Helm values file(s); may be repeated
@@ -67,6 +71,7 @@ PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-}"
 PRIVATE_REGISTRY_USER="${PRIVATE_REGISTRY_USER:-}"
 PRIVATE_REGISTRY_PASSWORD="${PRIVATE_REGISTRY_PASSWORD:-}"
 INSECURE_REGISTRY="${INSECURE_REGISTRY:-0}"
+SKIP_CONTAINERD_CONFIG="${SKIP_CONTAINERD_CONFIG:-0}"
 MODE="${MODE:-auto}"
 RUNTIME="${CONTAINER_RUNTIME:-}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
@@ -78,7 +83,7 @@ REGISTRY_REWRITE_MODE="${REGISTRY_REWRITE_MODE:-keep-path}"
 EXTRA_VALUES=()
 
 usage() {
-  sed -n '2,54p' "$0" | sed 's/^# \?//'
+  sed -n '2,58p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -94,6 +99,7 @@ while [[ $# -gt 0 ]]; do
     --registry-user)     PRIVATE_REGISTRY_USER="$2"; shift 2 ;;
     --registry-pass)     PRIVATE_REGISTRY_PASSWORD="$2"; shift 2 ;;
     --insecure-registry) INSECURE_REGISTRY=1; shift ;;
+    --skip-containerd-config) SKIP_CONTAINERD_CONFIG=1; shift ;;
     --mode)              MODE="$2"; shift 2 ;;
     --values)            EXTRA_VALUES+=("$2"); shift 2 ;;
     --runtime)           RUNTIME="$2"; shift 2 ;;
@@ -123,8 +129,17 @@ export REGISTRY_REWRITE_MODE
 export CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
 export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
-# Propagate insecure flag to pull helpers
+# Propagate insecure flag to pull helpers (plain HTTP, never HTTPS)
 export PULL_INSECURE="$INSECURE_REGISTRY"
+
+# Normalize registry host:port (strip http(s):// and /v2)
+if [[ -n "$PRIVATE_REGISTRY" ]]; then
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY#http://}"
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY#https://}"
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY%/}"
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY%/v2}"
+  PRIVATE_REGISTRY="${PRIVATE_REGISTRY%/v2/}"
+fi
 
 # Resolve mode
 case "$MODE" in
@@ -142,6 +157,33 @@ esac
 if [[ "$MODE" == "push" || "$MODE" == "load-and-push" ]]; then
   [[ -n "$PRIVATE_REGISTRY" ]] || die "--registry / PRIVATE_REGISTRY is required for mode=${MODE} (example: --registry ${DEFAULT_PRIVATE_REGISTRY} --insecure-registry)"
 fi
+
+# HTTP registries: kubelet defaults to HTTPS unless containerd is configured.
+# Auto-apply plain-HTTP config on THIS node; workers still need the same step.
+ensure_local_containerd_http_registry() {
+  [[ "$INSECURE_REGISTRY" -eq 1 && -n "$PRIVATE_REGISTRY" ]] || return 0
+  [[ "$SKIP_CONTAINERD_CONFIG" -eq 0 ]] || {
+    warn "Skipping containerd plain-HTTP config (--skip-containerd-config)"
+    return 0
+  }
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+
+  local cfg="${SCRIPT_DIR}/03-configure-containerd-registry.sh"
+  [[ -x "$cfg" ]] || die "Missing ${cfg}"
+
+  section "Configure local containerd for plain HTTP (not HTTPS)"
+  info "Registry ${PRIVATE_REGISTRY} — forcing http:// pulls for kubelet on this node"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$cfg" apply --registry "$PRIVATE_REGISTRY"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$cfg" apply --registry "$PRIVATE_REGISTRY"
+  else
+    die "Need root/sudo to configure containerd plain HTTP for ${PRIVATE_REGISTRY}. Run: sudo ${cfg} apply --registry ${PRIVATE_REGISTRY}"
+  fi
+
+  warn "Repeat on EVERY worker node (pods may schedule there):"
+  warn "  sudo ${cfg} apply --registry ${PRIVATE_REGISTRY}"
+}
 
 require_cmds awk sort
 RUNTIME="$(detect_runtime)"
@@ -433,17 +475,55 @@ print_helm_failure_diagnostics() {
     -l app.kubernetes.io/name=argocd-redis-secret-init \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
 
+  print_http_registry_remediation
+}
+
+# ---------------------------------------------------------------------------
+# Exact fix for:
+#   Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
+# Kubelet must use plain HTTP — never HTTPS — for this registry.
+# ---------------------------------------------------------------------------
+print_http_registry_remediation() {
+  local reg="${PRIVATE_REGISTRY:-${DEFAULT_PRIVATE_REGISTRY}}"
   cat <<EOF
 
-Common air-gap causes:
-  1) Nodes cannot pull from ${PRIVATE_REGISTRY:-<registry>} over HTTP
-     → configure containerd hosts.toml / Docker insecure-registries for that host
-  2) Stuck redis-secret-init pre-upgrade Job (ImagePullBackOff)
-     → re-run with --redis-secret-init manual (default) which skips the hook
-  3) Previous failed hook Job
-     → kubectl -n ${NAMESPACE} delete job -l app.kubernetes.io/name=argocd-redis-secret-init
+================================================================
+ FIX: kubelet used HTTPS — force plain HTTP on EVERY node
+================================================================
+Error means containerd dialed https://${reg} but Zot speaks HTTP only.
+
+On master + ALL workers (including the node with the failing pod):
+
+  cd ~/agrocd/argocd-airgap
+  sudo ./scripts/03-configure-containerd-registry.sh apply --registry ${reg}
+
+That writes hosts.toml + mirrors with endpoint http://${reg} (not https://).
+
+Verify on the failing worker:
+
+  cat /etc/containerd/certs.d/${reg}/hosts.toml
+  grep -A2 '${reg}' /etc/containerd/config.toml
+  curl -sS -o /dev/null -w '%{http_code}\\n' http://${reg}/v2/
+
+Recreate pods:
+
+  kubectl -n ${NAMESPACE} delete pods --all
+  kubectl -n ${NAMESPACE} get pods -w
 
 EOF
+}
+
+# After install/wait, surface ImagePullBackOff with the HTTPS hint if present.
+warn_if_image_pull_https_failure() {
+  [[ -n "${PRIVATE_REGISTRY:-}" ]] || return 0
+  local events
+  events="$(kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get events \
+    --field-selector reason=Failed \
+    -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null || true)"
+  if echo "$events" | grep -q 'HTTP response to HTTPS client'; then
+    err "Detected kubelet HTTPS pulls against HTTP registry ${PRIVATE_REGISTRY}"
+    print_http_registry_remediation
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -535,11 +615,13 @@ helm_install() {
   done
 
   # Broader readiness: all pods in namespace with app.kubernetes.io/part-of=argocd
-  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" wait \
+  if ! kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" wait \
     --for=condition=Ready pods \
     -l app.kubernetes.io/part-of=argocd \
-    --timeout="$WAIT_TIMEOUT" \
-    || warn "Some pods not Ready within ${WAIT_TIMEOUT}; check: kubectl -n ${NAMESPACE} get pods"
+    --timeout="$WAIT_TIMEOUT"; then
+    warn "Some pods not Ready within ${WAIT_TIMEOUT}; check: kubectl -n ${NAMESPACE} get pods"
+    warn_if_image_pull_https_failure
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -568,11 +650,25 @@ Useful status commands:
   kubectl ${KUBECTL_CTX_ARGS[*]+"${KUBECTL_CTX_ARGS[*]}"} -n ${NAMESPACE} get pods
 
 EOF
+
+  if [[ -n "${PRIVATE_REGISTRY:-}" && "$INSECURE_REGISTRY" -eq 1 ]]; then
+    cat <<EOF
+HTTP registry reminder (${PRIVATE_REGISTRY}):
+  Pushing with --insecure-registry is NOT enough for kubelet.
+  Every node needs containerd hosts.toml or pods stay in ImagePullBackOff:
+
+    sudo ./scripts/03-configure-containerd-registry.sh apply --registry ${PRIVATE_REGISTRY}
+
+EOF
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Before push/helm: force plain HTTP on local containerd (not HTTPS)
+ensure_local_containerd_http_registry
+
 case "$MODE" in
   load)
     load_images
