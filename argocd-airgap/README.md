@@ -10,6 +10,7 @@ argocd-airgap/
 │   ├── 01-online-prepare.sh   # Connected: pull Argo CD (+ optional Zot) chart/images
 │   ├── 02-airgap-deploy.sh    # Air-gapped: load/push images + Helm install
 │   ├── 03-zot-registry.sh     # Start/stop local Zot (container or Helm)
+│   ├── 04-configure-containerd-registry.sh  # Allow kubelet HTTP pulls from Zot
 │   └── lib/common.sh
 ├── helm/
 │   └── values-airgap.yaml     # Argo CD operator overrides
@@ -142,27 +143,58 @@ export PRIVATE_REGISTRY=zot-registry:30001
 
 ## Allowing Kubernetes to pull from HTTP Zot
 
-Lab Zot serves **plain HTTP**. Nodes must treat it as an insecure registry.
+Lab Zot serves **plain HTTP**. **Every node** must treat it as an insecure registry, or kubelet keeps trying HTTPS and pods stay in `ImagePullBackOff`:
 
-**containerd** (`/etc/containerd/certs.d/<host:port>/hosts.toml`):
+```text
+Failed to pull image "zot-registry:30001/argoproj/argocd:v3.5.0":
+Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
+```
+
+### Fix (run on every node)
+
+```bash
+# On k8s-master, k8s-worker1, k8s-worker2, ...
+sudo ./scripts/04-configure-containerd-registry.sh apply --registry zot-registry:30001
+
+# Then recreate pods so pulls retry over HTTP
+kubectl -n argocd delete pods --all
+kubectl -n argocd get pods -w
+```
+
+This writes `/etc/containerd/certs.d/zot-registry:30001/hosts.toml` and restarts containerd.
+
+Manual equivalent:
 
 ```toml
-server = "http://127.0.0.1:5000"
+# /etc/containerd/certs.d/zot-registry:30001/hosts.toml
+server = "http://zot-registry:30001"
 
-[host."http://127.0.0.1:5000"]
+[host."http://zot-registry:30001"]
   capabilities = ["pull", "resolve", "push"]
   skip_verify = true
 ```
 
-**Docker** (`/etc/docker/daemon.json`):
+Ensure `config.toml` has:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "/etc/containerd/certs.d"
+```
+
+**Docker** (if used on nodes), `/etc/docker/daemon.json`:
 
 ```json
 {
-  "insecure-registries": ["127.0.0.1:5000", "192.168.1.10:5000"]
+  "insecure-registries": ["zot-registry:30001"]
 }
 ```
 
-Replace the host/IP with whatever `./scripts/03-zot-registry.sh addr` prints (use a node-reachable IP for multi-node clusters, not `127.0.0.1`).
+Also confirm nodes can resolve and reach the registry:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://zot-registry:30001/v2/
+# expect 200 or 401
+```
 
 ## What each script does
 
@@ -176,6 +208,10 @@ Replace the host/IP with whatever `./scripts/03-zot-registry.sh addr` prints (us
 1. Loads `zot-images.tar` into the local runtime
 2. Starts Zot (container or Helm)
 3. Writes `artifacts/zot.env` with `PRIVATE_REGISTRY=...`
+
+### `04-configure-containerd-registry.sh`
+1. Writes containerd `hosts.toml` for plain-HTTP pulls from Zot
+2. Restarts containerd so kubelet stops using HTTPS
 
 ### `02-airgap-deploy.sh`
 1. Loads Argo CD images from the tar
