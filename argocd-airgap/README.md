@@ -117,7 +117,9 @@ kubectl -n argocd delete pods --all
 kubectl -n argocd get pods -w
 ```
 
-This writes `/etc/containerd/certs.d/zot-registry:30001/hosts.toml` and restarts containerd.
+This writes `/etc/containerd/certs.d/zot-registry:30001/hosts.toml` **and** sets
+`config_path = "/etc/containerd/certs.d"` in `config.toml` (kubeadm often ships
+`config_path = ''`, which makes `hosts.toml` ignored so kubelet keeps using HTTPS).
 
 ```toml
 # /etc/containerd/certs.d/zot-registry:30001/hosts.toml
