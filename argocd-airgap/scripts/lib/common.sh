@@ -5,13 +5,10 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Default Zot registry (cluster-reachable LAN address)
-# Advertise this host:port in zot.env / Helm values so workers can pull.
+# Default private registry (cluster-reachable LAN address)
 # Override with --registry / PRIVATE_REGISTRY when needed.
 # ---------------------------------------------------------------------------
-DEFAULT_ZOT_HOST="${DEFAULT_ZOT_HOST:-192.168.56.10}"
-DEFAULT_ZOT_PORT="${DEFAULT_ZOT_PORT:-5000}"
-DEFAULT_ZOT_REGISTRY="${DEFAULT_ZOT_REGISTRY:-${DEFAULT_ZOT_HOST}:${DEFAULT_ZOT_PORT}}"
+DEFAULT_PRIVATE_REGISTRY="${DEFAULT_PRIVATE_REGISTRY:-192.168.56.10:5000}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -352,8 +349,8 @@ _pull_with_crane() {
 
 # ---------------------------------------------------------------------------
 # Push a single image reference already present in the local runtime.
-# Prefer skopeo with --format=oci — Zot rejects Docker schema2 manifests (HTTP 415).
-# For plain-HTTP registries (typical lab Zot), skopeo needs registries.conf
+# Prefer skopeo with --format=oci — some registries reject Docker schema2 (HTTP 415).
+# For plain-HTTP registries, skopeo needs registries.conf
 # insecure=true — --dest-tls-verify=false alone still speaks HTTPS.
 # Fall back to ctr --plain-http, then crane --insecure.
 # ---------------------------------------------------------------------------
@@ -438,7 +435,7 @@ push_image() {
     if ctr_cmd "${args[@]}" "$image"; then
       return 0
     fi
-    warn "ctr plain-http push failed (Zot may require OCI manifests); trying skopeo"
+    warn "ctr plain-http push failed (registry may require OCI manifests); trying skopeo"
   fi
 
   if command -v skopeo >/dev/null 2>&1; then
@@ -469,7 +466,7 @@ push_image() {
     fi
 
     [[ -n "$tmp" ]] && rm -f "$tmp"
-    die "skopeo push failed for ${image}. For HTTP Zot use: --registry HOST:PORT --insecure-registry"
+    die "skopeo push failed for ${image}. For HTTP registries use: --registry HOST:PORT --insecure-registry"
   fi
 
   if command -v crane >/dev/null 2>&1; then
@@ -482,7 +479,7 @@ push_image() {
       rm -f "$tmp"
       die "Failed to save ${image} for crane push"
     fi
-    warn "skopeo not found; crane may fail against Zot (Docker schema2 → HTTP 415). Install skopeo for OCI pushes."
+    warn "skopeo not found; crane may fail on registries that reject Docker schema2 (HTTP 415). Install skopeo for OCI pushes."
     if ! crane "${crane_args[@]}" "$tmp" "$image"; then
       if [[ "$insecure" -ne 1 ]]; then
         warn "Retrying crane push with --insecure (plain HTTP)"

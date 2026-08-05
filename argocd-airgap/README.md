@@ -1,23 +1,19 @@
 # Argo CD Air-Gapped Helm Deployment
 
-Robust Bash + Helm workflow for installing Argo CD in a disconnected environment, using **[Zot](https://zotregistry.dev)** as the local OCI registry.
+Bash + Helm workflow for installing Argo CD in a disconnected environment using a **private OCI registry** (default example: `192.168.56.10:5000`).
 
 ## Layout
 
 ```
 argocd-airgap/
 ├── scripts/
-│   ├── 01-online-prepare.sh   # Connected: pull Argo CD (+ optional Zot) chart/images
-│   ├── 02-airgap-deploy.sh    # Air-gapped: load/push images + Helm install
-│   ├── 03-zot-registry.sh     # Start/stop local Zot (container or Helm)
-│   ├── 04-configure-containerd-registry.sh  # Allow kubelet HTTP pulls from Zot
+│   ├── 01-online-prepare.sh                 # Connected: pull Argo CD chart/images
+│   ├── 02-airgap-deploy.sh                  # Air-gapped: load/push images + Helm install
+│   ├── 03-configure-containerd-registry.sh  # Allow kubelet HTTP pulls from the registry
 │   └── lib/common.sh
 ├── helm/
-│   └── values-airgap.yaml     # Argo CD operator overrides
-├── zot/
-│   ├── config.json            # Zot HTTP registry config (:5000)
-│   └── values-airgap.yaml     # In-cluster Zot Helm overrides
-└── artifacts/                 # Generated transfer bundle (gitignored contents)
+│   └── values-airgap.yaml                   # Argo CD operator overrides
+└── artifacts/                               # Generated transfer bundle (gitignored contents)
 ```
 
 ## Prerequisites
@@ -25,43 +21,36 @@ argocd-airgap/
 | Phase | Tools |
 |-------|--------|
 | Online | `helm` (≥ 3.8), `docker`/`podman`/`nerdctl`/`ctr`, optional `crane`/`skopeo` |
-| Air-gapped | Same runtime, `curl`; `kubectl`+`helm` for cluster install. **`skopeo` recommended** for OCI pushes to Zot. Optional: `crane` |
+| Air-gapped | Same runtime, `curl`; `kubectl`+`helm` for cluster install. **`skopeo` recommended** for OCI pushes. Optional: `crane` |
 
-## Recommended flow (with Zot)
+A private registry must already be reachable from every Kubernetes node (for example `http://192.168.56.10:5000`).
 
-### 1. Online — package Argo CD **and** Zot
+## Recommended flow
+
+### 1. Online — package Argo CD
 
 ```bash
 cd argocd-airgap
 chmod +x scripts/*.sh
 
-./scripts/01-online-prepare.sh --with-zot
+./scripts/01-online-prepare.sh
 # Prefer containerd ctr for pulls:
-#   ./scripts/01-online-prepare.sh --with-zot --runtime ctr --pull-tool ctr
-#   ./scripts/01-online-prepare.sh --with-zot --pull-tool ctr   # pull via ctr, save via docker/etc
-# optional: --ctr-namespace k8s.io
+#   ./scripts/01-online-prepare.sh --runtime ctr --pull-tool ctr
+#   ./scripts/01-online-prepare.sh --pull-tool ctr
 ```
-
-This pulls the Argo CD chart/images **and**:
-
-- Zot container image → `artifacts/zot-images.tar`
-- Zot Helm chart → `artifacts/zot-*.tgz`
-- Zot config/values → `artifacts/zot/`
 
 ### Using `ctr` (containerd) to download images
 
 ```bash
-# Full ctr workflow (pull + export into the transfer tar)
-export CTR_NAMESPACE=k8s.io   # kubelet namespace (default)
+export CTR_NAMESPACE=k8s.io
 ./scripts/01-online-prepare.sh --runtime ctr --pull-tool ctr
 
-# Or only use ctr for downloads, keep docker/podman for packaging:
-./scripts/01-online-prepare.sh --pull-tool ctr
-
 # Air-gapped: import the tar into containerd (visible to kubelet)
-./scripts/02-airgap-deploy.sh --runtime ctr --use-zot --artifacts ./artifacts
-# Equivalent manual import:
-#   ctr -n k8s.io images import artifacts/argo-cd-images.tar
+./scripts/02-airgap-deploy.sh \
+  --runtime ctr \
+  --registry 192.168.56.10:5000 \
+  --insecure-registry \
+  --artifacts ./artifacts
 ```
 
 `ctr` notes:
@@ -71,9 +60,8 @@ export CTR_NAMESPACE=k8s.io   # kubelet namespace (default)
 | Pull | `ctr -n k8s.io images pull [--platform linux/amd64] <ref>` |
 | Export | `ctr -n k8s.io images export argo-cd-images.tar <refs…>` |
 | Import | `ctr -n k8s.io images import argo-cd-images.tar` |
-| HTTP registry | `--plain-http` (set automatically with `--use-zot` / `--insecure-registry`) |
-| Namespace | Default `k8s.io` so kubelet can see imported images; override with `--ctr-namespace` |
-| Unpack fallback | If overlay whiteouts fail on the bastion, import retries with `--no-unpack` (content still exportable/pushable; cluster nodes unpack normally) |
+| HTTP registry | `--plain-http` (set with `--insecure-registry`) |
+| Namespace | Default `k8s.io` so kubelet can see imported images |
 | Env | `CTR_NAMESPACE`, `CTR_ADDRESS`, `CTR_PLATFORM`, `CTR_NO_UNPACK=1` |
 
 ### 2. Transfer
@@ -85,85 +73,39 @@ tar -xvf argo-cd-airgap-bundle.tar
 cd argocd-airgap
 ```
 
-### 3. Air-gapped — start Zot, then install Argo CD
+### 3. Air-gapped — push to registry and install
 
 ```bash
-# Start Zot as a local container; advertises 192.168.56.10:5000 by default
-./scripts/03-zot-registry.sh start
+# On every node: allow plain-HTTP pulls from the registry
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
 
-# Load Argo CD images, push them into Zot, helm upgrade --install
-./scripts/02-airgap-deploy.sh --use-zot --artifacts ./artifacts
-```
-
-`--use-zot` reads `artifacts/zot.env` (written by `03-zot-registry.sh`) and enables insecure HTTP pushes to Zot. The advertised address defaults to **`192.168.56.10:5000`** (cluster-reachable LAN IP), not `127.0.0.1`.
-
-### Existing Zot registry (HTTP)
-
-If Zot is already running on `192.168.56.10:5000`, do **not** start a new one. Push with plain HTTP:
-
-```bash
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
   --registry 192.168.56.10:5000 \
   --insecure-registry \
+  --redis-secret-init manual \
   --artifacts ./artifacts
 ```
 
-`--insecure-registry` is required for HTTP Zot. Without it, skopeo tries HTTPS and fails with:
+`--insecure-registry` is required for HTTP registries. Without it, skopeo tries HTTPS and fails with:
 `http: server gave HTTP response to HTTPS client`.
 
-Equivalent:
+## Allowing Kubernetes to pull from an HTTP registry
 
-```bash
-export PRIVATE_REGISTRY=192.168.56.10:5000
-./scripts/02-airgap-deploy.sh --runtime ctr --use-zot --insecure-registry --artifacts ./artifacts
-# --use-zot forces insecure HTTP when PRIVATE_REGISTRY is already set
-```
-
-## Zot registry commands
-
-```bash
-./scripts/03-zot-registry.sh start              # container backend (default)
-./scripts/03-zot-registry.sh status
-./scripts/03-zot-registry.sh addr               # print host:port
-./scripts/03-zot-registry.sh stop
-
-./scripts/03-zot-registry.sh start --backend helm --namespace zot
-./scripts/03-zot-registry.sh start --port 5000 --registry 192.168.56.10:5000
-```
-
-| Flag | Description |
-|------|-------------|
-| `--backend container\|binary\|helm` | Local container (default), native binary, or in-cluster Helm |
-| `--port PORT` | Listen / host port (default `5000`) |
-| `--registry HOST:PORT` | Advertised address written to `zot.env` (default `192.168.56.10:$PORT`) |
-| `--data-dir DIR` | Persistent storage directory |
-| `--config FILE` | Zot `config.json` (default `zot/config.json`) |
-| `--binary PATH` | Path to packaged `zot` binary (binary backend) |
-
-## Allowing Kubernetes to pull from HTTP Zot
-
-Lab Zot serves **plain HTTP**. **Every node** must treat it as an insecure registry, or kubelet keeps trying HTTPS and pods stay in `ImagePullBackOff`:
+**Every node** must treat the registry as insecure, or kubelet keeps trying HTTPS and pods stay in `ImagePullBackOff`:
 
 ```text
 Failed to pull image "192.168.56.10:5000/argoproj/argocd:v3.5.0":
 Head "https://192.168.56.10:5000/v2/...": http: server gave HTTP response to HTTPS client
 ```
 
-### Fix (run on every node)
-
 ```bash
-# On k8s-master, k8s-worker1, k8s-worker2, ...
-sudo ./scripts/04-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
-
-# Then recreate pods so pulls retry over HTTP
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
 kubectl -n argocd delete pods --all
 kubectl -n argocd get pods -w
 ```
 
 This writes `/etc/containerd/certs.d/192.168.56.10:5000/hosts.toml` and restarts containerd.
-
-Manual equivalent:
 
 ```toml
 # /etc/containerd/certs.d/192.168.56.10:5000/hosts.toml
@@ -189,8 +131,6 @@ Ensure `config.toml` has:
 }
 ```
 
-Also confirm nodes can resolve and reach the registry:
-
 ```bash
 curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.56.10:5000/v2/
 # expect 200 or 401
@@ -202,20 +142,14 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.56.10:5000/v2/
 1. Adds the Argo Helm repo and pulls `argo-cd`
 2. Extracts images with `helm template` (no hardcoded tags)
 3. Pulls/saves images to `argo-cd-images.tar`
-4. With `--with-zot`: also packages the Zot image + chart
 
-### `03-zot-registry.sh`
-1. Loads `zot-images.tar` into the local runtime
-2. Starts Zot (container or Helm)
-3. Writes `artifacts/zot.env` with `PRIVATE_REGISTRY=...`
-
-### `04-configure-containerd-registry.sh`
-1. Writes containerd `hosts.toml` for plain-HTTP pulls from Zot
+### `03-configure-containerd-registry.sh`
+1. Writes containerd `hosts.toml` for plain-HTTP pulls
 2. Restarts containerd so kubelet stops using HTTPS
 
 ### `02-airgap-deploy.sh`
 1. Loads Argo CD images from the tar
-2. Retags/pushes to Zot (`--use-zot`) or another `--registry`
+2. Retags/pushes to `--registry`
 3. Generates air-gap Helm values and runs `helm upgrade --install`
 4. Waits for readiness and prints the admin password command
 
@@ -232,12 +166,9 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 
 | Flag / env | Description |
 |------------|-------------|
-| `--with-zot` | Also package Zot image + Helm chart |
-| `--zot-image REF` | Override Zot image reference |
-| `--zot-chart-version V` | Pin Zot Helm chart version |
 | `--chart-version VER` | Pin Argo CD Helm chart version |
 | `--runtime NAME` | `docker` \| `podman` \| `nerdctl` \| `ctr` |
-| `--pull-tool auto\|runtime\|crane\|ctr` | Image pull strategy (`ctr` = `ctr images pull`) |
+| `--pull-tool auto\|runtime\|crane\|ctr` | Image pull strategy |
 | `--ctr-namespace NS` | containerd namespace (default `k8s.io`) |
 | `--ctr-address PATH` | containerd socket path |
 | `--skip-pull` | Re-package images already present locally |
@@ -246,8 +177,7 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 
 | Flag / env | Description |
 |------------|-------------|
-| `--use-zot` | Use Zot via `artifacts/zot.env` (sets registry + insecure HTTP) |
-| `--registry` / `PRIVATE_REGISTRY` | Explicit registry host[:port] |
+| `--registry` / `PRIVATE_REGISTRY` | Private registry host[:port] (e.g. `192.168.56.10:5000`) |
 | `--runtime NAME` | `docker` \| `podman` \| `nerdctl` \| `ctr` |
 | `--ctr-namespace NS` | containerd namespace (default `k8s.io`) |
 | `--mode` | `auto`, `load`, `push`, `load-and-push` |
@@ -264,10 +194,9 @@ If you see:
 Error: UPGRADE FAILED: pre-upgrade hooks failed: timed out waiting for the condition
 ```
 
-that is almost always the `redis-secret-init` Job (ImagePullBackOff from Zot). Fix:
+that is almost always the `redis-secret-init` Job (ImagePullBackOff). Fix:
 
 ```bash
-# Clean stuck hook Job, then re-run (manual secret init is the default)
 kubectl -n argocd delete job -l app.kubernetes.io/name=argocd-redis-secret-init --ignore-not-found
 
 ./scripts/02-airgap-deploy.sh \
@@ -278,8 +207,7 @@ kubectl -n argocd delete job -l app.kubernetes.io/name=argocd-redis-secret-init 
   --artifacts ./artifacts
 ```
 
-Also ensure every node can pull HTTP from Zot (`containerd` `hosts.toml` / Docker `insecure-registries` for `192.168.56.10:5000`).
-
+Also ensure every node can pull HTTP from the registry (`containerd` `hosts.toml` / Docker `insecure-registries`).
 
 ### Image rewrite modes
 
@@ -288,28 +216,26 @@ Also ensure every node can pull HTTP from Zot (`containerd` `hosts.toml` / Docke
 
 ## Helm values layering
 
-1. `artifacts/values-generated-airgap.yaml` — image repos/tags for Zot
+1. `artifacts/values-generated-airgap.yaml` — image repos/tags for the private registry
 2. `helm/values-airgap.yaml` — operator defaults
 3. Any `--values` files on the CLI
 
-## Example: end-to-end with Zot
+## Example: end-to-end
 
 ```bash
 # --- Online ---
-./scripts/01-online-prepare.sh --with-zot --pull-tool crane
+./scripts/01-online-prepare.sh --pull-tool crane
 tar -C .. -cvf /media/usb/argo-cd-airgap-bundle.tar argocd-airgap
 
 # --- Air-gapped ---
 tar -xvf /media/usb/argo-cd-airgap-bundle.tar
 cd argocd-airgap
 
-./scripts/03-zot-registry.sh start --port 5000
-# Advertises 192.168.56.10:5000 — configure containerd on EVERY node:
-sudo ./scripts/04-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
 
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
-  --use-zot \
+  --registry 192.168.56.10:5000 \
   --insecure-registry \
   --redis-secret-init manual \
   --artifacts ./artifacts \

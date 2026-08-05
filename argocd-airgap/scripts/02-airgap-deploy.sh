@@ -32,7 +32,7 @@
 #   --registry-user USER    Registry username (env: PRIVATE_REGISTRY_USER)
 #   --registry-pass PASS    Registry password (env: PRIVATE_REGISTRY_PASSWORD)
 #   --insecure-registry     Use plain HTTP to the registry (required for typical
-#                           lab Zot without TLS, e.g. 192.168.56.10:5000)
+#                           lab registries without TLS, e.g. 192.168.56.10:5000)
 #   --mode MODE             load | push | load-and-push  (default: auto)
 #                             auto = push if --registry set, else load
 #   --values FILE           Extra Helm values file(s); may be repeated
@@ -44,9 +44,6 @@
 #   --dry-run               Render / plan only; do not install
 #   --skip-helm             Only load/push images; skip Helm install
 #   --rewrite-mode MODE     keep-path | flatten  (default: keep-path)
-#   --use-zot               Use Zot via artifacts/zot.env (sets insecure HTTP).
-#                           For an *existing* Zot, prefer:
-#                             --registry 192.168.56.10:5000 --insecure-registry
 #   --redis-secret-init M   manual (default) | helm
 #                           manual: create argocd-redis Secret and disable the
 #                           chart pre-install/pre-upgrade Job (avoids hook
@@ -76,13 +73,12 @@ KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-10m}"
 DRY_RUN=0
 SKIP_HELM=0
-USE_ZOT=0
 REDIS_SECRET_INIT="${REDIS_SECRET_INIT:-manual}"
 REGISTRY_REWRITE_MODE="${REGISTRY_REWRITE_MODE:-keep-path}"
 EXTRA_VALUES=()
 
 usage() {
-  sed -n '2,58p' "$0" | sed 's/^# \?//'
+  sed -n '2,54p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -108,7 +104,8 @@ while [[ $# -gt 0 ]]; do
     --dry-run)           DRY_RUN=1; shift ;;
     --skip-helm)         SKIP_HELM=1; shift ;;
     --rewrite-mode)      REGISTRY_REWRITE_MODE="$2"; shift 2 ;;
-    --use-zot)           USE_ZOT=1; shift ;;
+    --use-zot)
+      die "--use-zot was removed. Pass --registry ${DEFAULT_PRIVATE_REGISTRY} --insecure-registry instead" ;;
     --redis-secret-init) REDIS_SECRET_INIT="$2"; shift 2 ;;
     -h|--help)           usage ;;
     *) die "Unknown argument: $1 (use --help)" ;;
@@ -126,38 +123,7 @@ export REGISTRY_REWRITE_MODE
 export CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
 export CTR_ADDRESS="${CTR_ADDRESS:-}"
 
-# ---------------------------------------------------------------------------
-# Zot integration: load artifacts/zot.env produced by 03-zot-registry.sh
-# For an existing Zot (e.g. 192.168.56.10:5000), skip --use-zot and pass:
-#   --registry 192.168.56.10:5000 --insecure-registry
-# CLI --registry / PRIVATE_REGISTRY wins over zot.env when both are set.
-# ---------------------------------------------------------------------------
-if [[ "$USE_ZOT" -eq 1 ]]; then
-  ZOT_ENV="${ARTIFACTS_DIR}/zot.env"
-  if [[ -f "$ZOT_ENV" ]]; then
-    info "Loading Zot registry settings from ${ZOT_ENV}"
-    # Preserve CLI --registry / PRIVATE_REGISTRY over whatever zot.env advertises
-    _cli_registry="$PRIVATE_REGISTRY"
-    load_manifest "$ZOT_ENV"
-    if [[ -n "$_cli_registry" ]]; then
-      PRIVATE_REGISTRY="$_cli_registry"
-      info "Keeping CLI --registry=${PRIVATE_REGISTRY} (overrides zot.env)"
-    else
-      PRIVATE_REGISTRY="${PRIVATE_REGISTRY:-${ZOT_REGISTRY:-}}"
-    fi
-    unset _cli_registry
-  elif [[ -n "$PRIVATE_REGISTRY" ]]; then
-    info "--use-zot with PRIVATE_REGISTRY=${PRIVATE_REGISTRY} (no zot.env; existing registry)"
-  else
-    die "--use-zot requires ${ZOT_ENV} or --registry / PRIVATE_REGISTRY. For existing Zot: --registry 192.168.56.10:5000 --insecure-registry"
-  fi
-  [[ -n "$PRIVATE_REGISTRY" ]] || die "zot.env did not define PRIVATE_REGISTRY"
-  # Lab Zot speaks plain HTTP by default
-  INSECURE_REGISTRY=1
-  info "Using Zot registry: ${PRIVATE_REGISTRY} (insecure HTTP pushes enabled)"
-fi
-
-# Propagate insecure flag to pull helpers (after --use-zot may set it)
+# Propagate insecure flag to pull helpers
 export PULL_INSECURE="$INSECURE_REGISTRY"
 
 # Resolve mode
@@ -174,7 +140,7 @@ case "$MODE" in
 esac
 
 if [[ "$MODE" == "push" || "$MODE" == "load-and-push" ]]; then
-  [[ -n "$PRIVATE_REGISTRY" ]] || die "--registry / PRIVATE_REGISTRY is required for mode=${MODE}"
+  [[ -n "$PRIVATE_REGISTRY" ]] || die "--registry / PRIVATE_REGISTRY is required for mode=${MODE} (example: --registry ${DEFAULT_PRIVATE_REGISTRY} --insecure-registry)"
 fi
 
 require_cmds awk sort
