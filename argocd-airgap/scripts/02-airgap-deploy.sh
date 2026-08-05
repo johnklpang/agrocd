@@ -47,6 +47,11 @@
 #   --use-zot               Use Zot via artifacts/zot.env (sets insecure HTTP).
 #                           For an *existing* Zot, prefer:
 #                             --registry zot-registry:30001 --insecure-registry
+#   --redis-secret-init M   manual (default) | helm
+#                           manual: create argocd-redis Secret and disable the
+#                           chart pre-install/pre-upgrade Job (avoids hook
+#                           timeouts when nodes cannot pull the Job image yet)
+#                           helm: let the chart Job create the secret
 #   -h, --help              Show help
 # =============================================================================
 
@@ -72,11 +77,12 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-10m}"
 DRY_RUN=0
 SKIP_HELM=0
 USE_ZOT=0
+REDIS_SECRET_INIT="${REDIS_SECRET_INIT:-manual}"
 REGISTRY_REWRITE_MODE="${REGISTRY_REWRITE_MODE:-keep-path}"
 EXTRA_VALUES=()
 
 usage() {
-  sed -n '2,52p' "$0" | sed 's/^# \?//'
+  sed -n '2,58p' "$0" | sed 's/^# \?//'
   exit 0
 }
 
@@ -103,10 +109,16 @@ while [[ $# -gt 0 ]]; do
     --skip-helm)         SKIP_HELM=1; shift ;;
     --rewrite-mode)      REGISTRY_REWRITE_MODE="$2"; shift 2 ;;
     --use-zot)           USE_ZOT=1; shift ;;
+    --redis-secret-init) REDIS_SECRET_INIT="$2"; shift 2 ;;
     -h|--help)           usage ;;
     *) die "Unknown argument: $1 (use --help)" ;;
   esac
 done
+
+case "$REDIS_SECRET_INIT" in
+  manual|helm) ;;
+  *) die "Invalid --redis-secret-init '${REDIS_SECRET_INIT}' (expected: manual|helm)" ;;
+esac
 
 resolve_roots
 [[ -n "$RUNTIME" ]] && CONTAINER_RUNTIME="$RUNTIME"
@@ -281,8 +293,6 @@ generate_airgap_values() {
   # Upstream chart hosts have shifted over time (public.ecr.aws ↔ ecr-public.aws.com).
   # The image map from the online phase always wins; these are fallbacks only.
   local redis_repo="ecr-public.aws.com/docker/library/redis"
-  local redis_exporter_repo="public.ecr.aws/bitnami/redis-exporter"
-  local haproxy_repo="ecr-public.aws.com/docker/library/haproxy"
   local argocd_tag="${APP_VERSION:-}"
   local dex_tag=""
   local redis_tag=""
@@ -301,11 +311,8 @@ generate_airgap_values() {
           dex_repo="$_img_repo"
           [[ -n "$_img_tag" ]] && dex_tag="$_img_tag"
           ;;
-        *redis-exporter*|*bitnami/redis-exporter*)
-          redis_exporter_repo="$_img_repo"
-          ;;
-        *haproxy*)
-          haproxy_repo="$_img_repo"
+        *redis-exporter*|*haproxy*)
+          # redis-ha helpers — ignored while redis-ha.enabled=false
           ;;
         *redis*)
           redis_repo="$_img_repo"
@@ -367,18 +374,101 @@ generate_airgap_values() {
     echo "    repository: ${redis_repo}"
     [[ -n "$redis_tag" ]] && echo "    tag: \"${redis_tag}\""
     echo
+    # Keep redis-ha disabled. Do NOT nest exporter.image as a map — the
+    # dependency chart expects exporter.image to be a string and Helm warns/errors
+    # when a table is provided (coalesce destination is a table...).
     echo "redis-ha:"
     echo "  enabled: false"
-    echo "  image:"
-    echo "    repository: ${redis_repo}"
-    [[ -n "$redis_tag" ]] && echo "    tag: \"${redis_tag}\""
-    echo "  haproxy:"
-    echo "    image:"
-    echo "      repository: ${haproxy_repo}"
-    echo "  exporter:"
-    echo "    image:"
-    echo "      repository: ${redis_exporter_repo}"
+    echo
+    # redisSecretInit Job is a Helm pre-install/pre-upgrade hook that pulls the
+    # Argo CD image. In air-gap installs that Job is a common timeout source
+    # (ImagePullBackOff). Default: disable the hook; script creates the Secret.
+    echo "redisSecretInit:"
+    if [[ "${REDIS_SECRET_INIT}" == "helm" ]]; then
+      echo "  enabled: true"
+      echo "  image:"
+      echo "    repository: ${argocd_repo}"
+      [[ -n "$argocd_tag" ]] && echo "    tag: \"${argocd_tag}\""
+    else
+      echo "  enabled: false"
+    fi
   } >"$out_file"
+}
+
+# ---------------------------------------------------------------------------
+# Ensure namespace exists
+# ---------------------------------------------------------------------------
+ensure_namespace() {
+  info "Ensuring namespace ${NAMESPACE}"
+  kubectl "${KUBECTL_CTX_ARGS[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
+    | kubectl "${KUBECTL_CTX_ARGS[@]}" apply -f -
+}
+
+# ---------------------------------------------------------------------------
+# Create argocd-redis Secret (key: auth) so we can disable redisSecretInit hooks.
+# ---------------------------------------------------------------------------
+ensure_redis_secret() {
+  ensure_namespace
+
+  if kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get secret argocd-redis >/dev/null 2>&1; then
+    info "Secret argocd-redis already exists in ${NAMESPACE}"
+    return 0
+  fi
+
+  local password
+  password="$(openssl rand -base64 32 | tr -d '\n=+/')"
+  info "Creating Secret argocd-redis (key: auth) in ${NAMESPACE}"
+  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" create secret generic argocd-redis \
+    --from-literal=auth="$password" \
+    --dry-run=client -o yaml \
+    | kubectl "${KUBECTL_CTX_ARGS[@]}" apply -f -
+}
+
+# ---------------------------------------------------------------------------
+# Remove stuck redis-secret-init hook Jobs from a previous failed upgrade
+# ---------------------------------------------------------------------------
+cleanup_stuck_hooks() {
+  info "Cleaning any stuck redis-secret-init hook Jobs"
+  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" delete job \
+    -l app.kubernetes.io/name=argocd-redis-secret-init \
+    --ignore-not-found=true >/dev/null 2>&1 || true
+  # Also match release-prefixed name used by some chart versions
+  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" delete job \
+    "${RELEASE_NAME}-redis-secret-init" \
+    --ignore-not-found=true >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Print diagnostics when Helm hooks / install fail
+# ---------------------------------------------------------------------------
+print_helm_failure_diagnostics() {
+  err "Helm install/upgrade failed. Gathering diagnostics..."
+  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get jobs,pods -o wide 2>/dev/null || true
+  echo
+  warn "Hook Job details (redis-secret-init is the usual pre-upgrade timeout):"
+  kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get pods,jobs \
+    -l app.kubernetes.io/name=argocd-redis-secret-init -o wide 2>/dev/null || true
+  local pod
+  while IFS= read -r pod; do
+    [[ -z "$pod" ]] && continue
+    echo
+    warn "Describe ${pod}:"
+    kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" describe pod "$pod" 2>/dev/null | tail -40 || true
+  done < <(kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" get pods \
+    -l app.kubernetes.io/name=argocd-redis-secret-init \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+  cat <<EOF
+
+Common air-gap causes:
+  1) Nodes cannot pull from ${PRIVATE_REGISTRY:-<registry>} over HTTP
+     → configure containerd hosts.toml / Docker insecure-registries for that host
+  2) Stuck redis-secret-init pre-upgrade Job (ImagePullBackOff)
+     → re-run with --redis-secret-init manual (default) which skips the hook
+  3) Previous failed hook Job
+     → kubectl -n ${NAMESPACE} delete job -l app.kubernetes.io/name=argocd-redis-secret-init
+
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -387,10 +477,8 @@ generate_airgap_values() {
 ensure_pull_secret() {
   [[ -n "$PRIVATE_REGISTRY" && -n "$PRIVATE_REGISTRY_USER" ]] || return 0
 
-  info "Ensuring namespace ${NAMESPACE} and imagePullSecret argocd-registry-secret"
-  kubectl "${KUBECTL_CTX_ARGS[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
-    | kubectl "${KUBECTL_CTX_ARGS[@]}" apply -f -
-
+  ensure_namespace
+  info "Ensuring imagePullSecret argocd-registry-secret"
   local docker_server="$PRIVATE_REGISTRY"
   # kubectl create docker-registry expects the registry host
   kubectl "${KUBECTL_CTX_ARGS[@]}" -n "$NAMESPACE" create secret docker-registry argocd-registry-secret \
@@ -410,7 +498,16 @@ helm_install() {
   local gen_values="${ARTIFACTS_DIR}/values-generated-airgap.yaml"
   generate_airgap_values "$gen_values"
 
+  ensure_namespace
   ensure_pull_secret
+  cleanup_stuck_hooks
+
+  if [[ "$REDIS_SECRET_INIT" == "manual" ]]; then
+    info "redis-secret-init mode: manual (create Secret, disable Helm hook Job)"
+    ensure_redis_secret
+  else
+    info "redis-secret-init mode: helm (chart pre-upgrade Job will create the Secret)"
+  fi
 
   local helm_args=(
     upgrade --install "$RELEASE_NAME" "$CHART_TGZ"
@@ -442,7 +539,10 @@ helm_install() {
   fi
 
   info "Running: helm ${helm_args[*]}"
-  helm "${helm_args[@]}"
+  if ! helm "${helm_args[@]}"; then
+    print_helm_failure_diagnostics
+    die "Helm upgrade --install failed (see diagnostics above)"
+  fi
 
   info "Waiting for Argo CD workloads to become Ready..."
   # Wait on the primary Deployments created by the chart

@@ -39,6 +39,15 @@ redis:
 redis-ha:
   enabled: false
 
+## The chart's redisSecretInit Job is a pre-install/pre-upgrade hook that often
+## times out in air-gap clusters (ImagePullBackOff from the private registry).
+## 02-airgap-deploy.sh defaults to --redis-secret-init manual which:
+##   1) creates Secret argocd-redis (key: auth)
+##   2) sets redisSecretInit.enabled=false
+## Override only if you intentionally want the Helm hook Job:
+# redisSecretInit:
+#   enabled: true
+
 ## CRDs: install from the chart (recommended for air-gap; no remote fetch).
 crds:
   install: true
