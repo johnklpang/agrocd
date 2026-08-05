@@ -217,7 +217,33 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 | `--mode` | `auto`, `load`, `push`, `load-and-push` |
 | `--rewrite-mode` | `keep-path` (default) or `flatten` |
 | `--insecure-registry` | Skip TLS verify / HTTP registry pushes (`ctr --plain-http`) |
+| `--redis-secret-init manual\|helm` | `manual` (default): create `argocd-redis` Secret and disable the pre-upgrade hook Job; `helm`: use the chart Job |
 | `--skip-helm` | Only load/push images |
+
+### Helm pre-upgrade hook timeouts
+
+If you see:
+
+```text
+Error: UPGRADE FAILED: pre-upgrade hooks failed: timed out waiting for the condition
+```
+
+that is almost always the `redis-secret-init` Job (ImagePullBackOff from Zot). Fix:
+
+```bash
+# Clean stuck hook Job, then re-run (manual secret init is the default)
+kubectl -n argocd delete job -l app.kubernetes.io/name=argocd-redis-secret-init --ignore-not-found
+
+./scripts/02-airgap-deploy.sh \
+  --runtime ctr \
+  --registry zot-registry:30001 \
+  --insecure-registry \
+  --redis-secret-init manual \
+  --artifacts ./artifacts
+```
+
+Also ensure every node can pull HTTP from Zot (`containerd` `hosts.toml` / Docker `insecure-registries` for `zot-registry:30001`).
+
 
 ### Image rewrite modes
 
