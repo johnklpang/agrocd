@@ -32,7 +32,7 @@
 #   --registry-user USER    Registry username (env: PRIVATE_REGISTRY_USER)
 #   --registry-pass PASS    Registry password (env: PRIVATE_REGISTRY_PASSWORD)
 #   --insecure-registry     Use plain HTTP to the registry (required for typical
-#                           lab registries without TLS, e.g. 192.168.56.10:5000)
+#                           lab registries without TLS, e.g. zot-registry:30001)
 #   --mode MODE             load | push | load-and-push  (default: auto)
 #                             auto = push if --registry set, else load
 #   --values FILE           Extra Helm values file(s); may be repeated
