@@ -280,6 +280,36 @@ kubectl -n argocd delete job -l app.kubernetes.io/name=argocd-redis-secret-init 
 
 Also ensure every node can pull HTTP from Zot (`containerd` `hosts.toml` / Docker `insecure-registries` for `zot-registry:30001`).
 
+### Pods pulling `127.0.0.1:5000/...` (connection refused)
+
+```text
+Pulling image "127.0.0.1:5000/argoproj/argocd:v3.5.0"
+dial tcp 127.0.0.1:5000: connect: connection refused
+```
+
+Helm values were generated with a **localhost** registry (often from `artifacts/zot.env` after `03-zot-registry.sh start` on the bastion). On `k8s-worker3`, `127.0.0.1` is the worker itself — not Zot.
+
+**Fix — redeploy with your cluster Zot hostname:**
+
+```bash
+./scripts/02-airgap-deploy.sh \
+  --runtime ctr \
+  --registry zot-registry:30001 \
+  --insecure-registry \
+  --redis-secret-init manual \
+  --artifacts ./artifacts
+
+# --registry overrides a stale 127.0.0.1:5000 in zot.env
+kubectl -n argocd delete pods --all
+```
+
+Confirm generated values no longer mention localhost:
+
+```bash
+grep repository artifacts/values-generated-airgap.yaml
+# expect: zot-registry:30001/argoproj/argocd  (not 127.0.0.1:5000)
+```
+
 
 ### Image rewrite modes
 
