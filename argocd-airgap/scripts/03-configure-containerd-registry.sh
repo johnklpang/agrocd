@@ -90,45 +90,58 @@ server = "http://${REGISTRY}"
 EOF
 }
 
+# hosts.toml under certs.d is IGNORED when config_path is empty ('').
+# kubeadm/containerd defaults often ship: config_path = ''
 ensure_config_path() {
   [[ -f "$CONTAINERD_CONFIG" ]] || {
     warn "containerd config not found at ${CONTAINERD_CONFIG}; writing hosts.toml only"
     return 0
   }
 
-  if grep -qE 'config_path\s*=' "$CONTAINERD_CONFIG"; then
-    local current
-    current="$(awk -F'=' '/config_path/ {gsub(/[ "'\''\t]/, "", $2); print $2; exit}' "$CONTAINERD_CONFIG" || true)"
-    if [[ -n "$current" && "$current" != "$CERTS_DIR" ]]; then
-      warn "containerd config_path is '${current}' (expected ${CERTS_DIR})"
-      warn "Pass --certs-dir ${current} or update config.toml config_path"
+  local changed=0
+  # Fix empty config_path = '' / "" (do NOT touch plugin_config_path)
+  if grep -qE '^[[:space:]]*config_path[[:space:]]*=[[:space:]]*['\''"]['\''"][[:space:]]*$' "$CONTAINERD_CONFIG"; then
+    info "Replacing empty config_path = '' with \"${CERTS_DIR}\" (required for hosts.toml)"
+    # Backup once per apply
+    cp -a "$CONTAINERD_CONFIG" "${CONTAINERD_CONFIG}.bak.argocd-airgap" 2>/dev/null || true
+    sed -i -E \
+      "s|^([[:space:]]*config_path[[:space:]]*=[[:space:]]*)['\"]['\"][[:space:]]*$|\1\"${CERTS_DIR}\"|" \
+      "$CONTAINERD_CONFIG"
+    changed=1
+  fi
+
+  # If config_path points somewhere else, warn (operator may use a custom certs.d)
+  local paths
+  paths="$(grep -E '^[[:space:]]*config_path[[:space:]]*=' "$CONTAINERD_CONFIG" \
+    | grep -v plugin_config_path \
+    | sed -E "s/^[[:space:]]*config_path[[:space:]]*=[[:space:]]*//; s/[\"'[:space:]]//g" \
+    || true)"
+  local p
+  local has_certs=0
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if [[ "$p" == "$CERTS_DIR" ]]; then
+      has_certs=1
     else
-      info "containerd config_path already set (${current:-ok})"
+      warn "Found config_path = \"${p}\" (expected \"${CERTS_DIR}\" for hosts.toml)"
     fi
-  else
-    info "Adding registry config_path to ${CONTAINERD_CONFIG}"
+  done <<<"$paths"
+
+  if [[ "$has_certs" -eq 0 ]]; then
+    info "Adding registry config_path = \"${CERTS_DIR}\" to ${CONTAINERD_CONFIG}"
     cat >>"$CONTAINERD_CONFIG" <<EOF
 
 # Added by 03-configure-containerd-registry.sh — enable certs.d hosts.toml (plain HTTP)
 [plugins."io.containerd.grpc.v1.cri".registry]
   config_path = "${CERTS_DIR}"
 EOF
+    changed=1
+  else
+    info "containerd config_path includes ${CERTS_DIR}"
   fi
 
-  # containerd 2.x / newer CRI plugin path (idempotent append if missing)
-  if ! grep -qE "io\.containerd\.cri\.v1\.images" "$CONTAINERD_CONFIG" || \
-     ! grep -qE 'config_path\s*=' "$CONTAINERD_CONFIG"; then
-    :
-  fi
-  if grep -q "io.containerd.cri.v1.images" "$CONTAINERD_CONFIG" && \
-     ! grep -A5 "io.containerd.cri.v1.images" "$CONTAINERD_CONFIG" | grep -q 'config_path'; then
-    info "Adding containerd 2.x images.registry config_path"
-    cat >>"$CONTAINERD_CONFIG" <<EOF
-
-# Added by 03-configure-containerd-registry.sh (containerd 2.x)
-[plugins."io.containerd.cri.v1.images".registry]
-  config_path = "${CERTS_DIR}"
-EOF
+  if [[ "$changed" -eq 1 ]]; then
+    info "Updated ${CONTAINERD_CONFIG} (backup: ${CONTAINERD_CONFIG}.bak.argocd-airgap)"
   fi
 }
 
@@ -236,6 +249,13 @@ cmd_verify() {
   info "HTTP ${code} (200 or 401 means the registry is reachable over HTTP)"
   [[ -f "$HOSTS_FILE" ]] && info "hosts.toml present" || warn "hosts.toml missing: ${HOSTS_FILE}"
   if [[ -f "$CONTAINERD_CONFIG" ]]; then
+    if grep -qE '^[[:space:]]*config_path[[:space:]]*=[[:space:]]*['\''"]['\''"][[:space:]]*$' "$CONTAINERD_CONFIG"; then
+      err "config_path is empty ('') — hosts.toml is IGNORED. Run: apply --registry ${REGISTRY}"
+    elif grep -E '^[[:space:]]*config_path[[:space:]]*=' "$CONTAINERD_CONFIG" | grep -vq plugin_config_path | grep -q "$CERTS_DIR"; then
+      info "config_path includes ${CERTS_DIR}"
+    else
+      warn "config_path may not point at ${CERTS_DIR} — kubelet can still use HTTPS"
+    fi
     if grep -q "http://${REGISTRY}" "$CONTAINERD_CONFIG" || [[ -f "$HOSTS_FILE" ]]; then
       info "Plain HTTP registry config looks present"
     else
