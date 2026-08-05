@@ -1,6 +1,8 @@
 # Argo CD Air-Gapped Helm Deployment
 
-Bash + Helm workflow for installing Argo CD in a disconnected environment using a **private OCI registry** (default example: `192.168.56.10:5000`).
+Bash + Helm workflow for installing Argo CD in a disconnected environment using an **existing private OCI registry**.
+
+Default registry: **`zot-registry:30001`** (`http://zot-registry:30001/v2/`).
 
 ## Layout
 
@@ -23,7 +25,7 @@ argocd-airgap/
 | Online | `helm` (≥ 3.8), `docker`/`podman`/`nerdctl`/`ctr`, optional `crane`/`skopeo` |
 | Air-gapped | Same runtime, `curl`; `kubectl`+`helm` for cluster install. **`skopeo` recommended** for OCI pushes. Optional: `crane` |
 
-A private registry must already be reachable from every Kubernetes node (for example `http://192.168.56.10:5000`).
+Assumes an existing registry (this lab: NodePort Zot at `http://zot-registry:30001/v2/`) reachable from every Kubernetes node. These scripts do **not** install or start the registry.
 
 ## Recommended flow
 
@@ -48,7 +50,7 @@ export CTR_NAMESPACE=k8s.io
 # Air-gapped: import the tar into containerd (visible to kubelet)
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
-  --registry 192.168.56.10:5000 \
+  --registry zot-registry:30001 \
   --insecure-registry \
   --artifacts ./artifacts
 ```
@@ -77,11 +79,11 @@ cd argocd-airgap
 
 ```bash
 # On every node: allow plain-HTTP pulls from the registry
-sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry:30001
 
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
-  --registry 192.168.56.10:5000 \
+  --registry zot-registry:30001 \
   --insecure-registry \
   --redis-secret-init manual \
   --artifacts ./artifacts
@@ -95,23 +97,23 @@ sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.1
 **Every node** must treat the registry as insecure, or kubelet keeps trying HTTPS and pods stay in `ImagePullBackOff`:
 
 ```text
-Failed to pull image "192.168.56.10:5000/argoproj/argocd:v3.5.0":
-Head "https://192.168.56.10:5000/v2/...": http: server gave HTTP response to HTTPS client
+Failed to pull image "zot-registry:30001/argoproj/argocd:v3.5.0":
+Head "https://zot-registry:30001/v2/...": http: server gave HTTP response to HTTPS client
 ```
 
 ```bash
-sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry:30001
 kubectl -n argocd delete pods --all
 kubectl -n argocd get pods -w
 ```
 
-This writes `/etc/containerd/certs.d/192.168.56.10:5000/hosts.toml` and restarts containerd.
+This writes `/etc/containerd/certs.d/zot-registry:30001/hosts.toml` and restarts containerd.
 
 ```toml
-# /etc/containerd/certs.d/192.168.56.10:5000/hosts.toml
-server = "http://192.168.56.10:5000"
+# /etc/containerd/certs.d/zot-registry:30001/hosts.toml
+server = "http://zot-registry:30001"
 
-[host."http://192.168.56.10:5000"]
+[host."http://zot-registry:30001"]
   capabilities = ["pull", "resolve", "push"]
   skip_verify = true
 ```
@@ -127,12 +129,12 @@ Ensure `config.toml` has:
 
 ```json
 {
-  "insecure-registries": ["192.168.56.10:5000"]
+  "insecure-registries": ["zot-registry:30001"]
 }
 ```
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.56.10:5000/v2/
+curl -sS -o /dev/null -w '%{http_code}\n' http://zot-registry:30001/v2/
 # expect 200 or 401
 ```
 
@@ -177,7 +179,7 @@ kubectl -n argocd get secret argocd-initial-admin-secret \
 
 | Flag / env | Description |
 |------------|-------------|
-| `--registry` / `PRIVATE_REGISTRY` | Private registry host[:port] (e.g. `192.168.56.10:5000`) |
+| `--registry` / `PRIVATE_REGISTRY` | Private registry host[:port] (e.g. `zot-registry:30001`) |
 | `--runtime NAME` | `docker` \| `podman` \| `nerdctl` \| `ctr` |
 | `--ctr-namespace NS` | containerd namespace (default `k8s.io`) |
 | `--mode` | `auto`, `load`, `push`, `load-and-push` |
@@ -201,7 +203,7 @@ kubectl -n argocd delete job -l app.kubernetes.io/name=argocd-redis-secret-init 
 
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
-  --registry 192.168.56.10:5000 \
+  --registry zot-registry:30001 \
   --insecure-registry \
   --redis-secret-init manual \
   --artifacts ./artifacts
@@ -211,8 +213,8 @@ Also ensure every node can pull HTTP from the registry (`containerd` `hosts.toml
 
 ### Image rewrite modes
 
-- **keep-path** (default): `quay.io/argoproj/argocd:v3.4.6` → `192.168.56.10:5000/argoproj/argocd:v3.4.6`
-- **flatten**: `quay.io/argoproj/argocd:v3.4.6` → `192.168.56.10:5000/argocd:v3.4.6`
+- **keep-path** (default): `quay.io/argoproj/argocd:v3.4.6` → `zot-registry:30001/argoproj/argocd:v3.4.6`
+- **flatten**: `quay.io/argoproj/argocd:v3.4.6` → `zot-registry:30001/argocd:v3.4.6`
 
 ## Helm values layering
 
@@ -231,11 +233,11 @@ tar -C .. -cvf /media/usb/argo-cd-airgap-bundle.tar argocd-airgap
 tar -xvf /media/usb/argo-cd-airgap-bundle.tar
 cd argocd-airgap
 
-sudo ./scripts/03-configure-containerd-registry.sh apply --registry 192.168.56.10:5000
+sudo ./scripts/03-configure-containerd-registry.sh apply --registry zot-registry:30001
 
 ./scripts/02-airgap-deploy.sh \
   --runtime ctr \
-  --registry 192.168.56.10:5000 \
+  --registry zot-registry:30001 \
   --insecure-registry \
   --redis-secret-init manual \
   --artifacts ./artifacts \

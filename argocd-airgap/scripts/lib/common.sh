@@ -8,7 +8,8 @@ set -euo pipefail
 # Default private registry (cluster-reachable LAN address)
 # Override with --registry / PRIVATE_REGISTRY when needed.
 # ---------------------------------------------------------------------------
-DEFAULT_PRIVATE_REGISTRY="${DEFAULT_PRIVATE_REGISTRY:-192.168.56.10:5000}"
+# Existing in-cluster / NodePort Zot (HTTP): http://zot-registry:30001/v2/
+DEFAULT_PRIVATE_REGISTRY="${DEFAULT_PRIVATE_REGISTRY:-zot-registry:30001}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -355,7 +356,7 @@ _pull_with_crane() {
 # Fall back to ctr --plain-http, then crane --insecure.
 # ---------------------------------------------------------------------------
 
-# Host[:port] from an image reference (192.168.56.10:5000/foo/bar:tag → 192.168.56.10:5000)
+# Host[:port] from an image reference (zot-registry:30001/foo/bar:tag → zot-registry:30001)
 image_registry_host() {
   local image="$1"
   echo "${image%%/*}"
